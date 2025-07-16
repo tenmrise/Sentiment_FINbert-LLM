@@ -46,8 +46,8 @@ def load_models_and_keys():
         return None, None
     models = {
         "summarizer_llm": ChatOpenAI(model=CONFIG["summarizer_model"], temperature=0.2, api_key=keys["OPENAI_API_KEY"]),
-        "verifier_llm": ChatOpenAI(model=CONFIG["verifier_model"], temperature=0.0, api_key=keys["OPENAI_API_KEY"]),
-        "analyst_llm": ChatGoogleGenerativeAI(model=CONFIG["analyst_model"], temperature=0.0, model_kwargs={"response_mime_type": "application/json"}, api_key=keys["GOOGLE_API_KEY"]),
+        "verifier_llm": ChatOpenAI(model=CONFIG["verifier_model"], temperature=0.5, api_key=keys["OPENAI_API_KEY"]),
+        "analyst_llm": ChatGoogleGenerativeAI(model=CONFIG["analyst_model"], temperature=0.5, model_kwargs={"response_mime_type": "application/json"}, api_key=keys["GOOGLE_API_KEY"]),
         "sentiment_analyzer": HuggingFaceEndpoint(repo_id=CONFIG["sentiment_model_repo_id"], task="text-classification", huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"])
     }
     return keys, models
@@ -126,13 +126,6 @@ def aggregate(state: PipelineState, aggregate_chain) -> PipelineState:
     except Exception as e: state["errors"].append(f"Final aggregation step failed: {e}"); state["report"] = {"error": "Report generation failed."}
     return state
 
-# --- NEW: Gatekeeper function to manage parallel branches ---
-def should_crosscheck(state: PipelineState) -> str:
-    if "finance_analysis" in state and "sentiment_scored" in state:
-        return "crosscheck"
-    else:
-        return "wait"
-
 # ==============================================================================
 # 2. STREAMLIT DASHBOARD UI
 # ==============================================================================
@@ -159,20 +152,14 @@ def run_pipeline(tickers, start_date, end_date):
     g.add_node("aggregate", lambda state: aggregate(state, aggregate_chain))
     
     g.set_entry_point("fetch_news")
-    g.add_edge("fetch_news", "summarise_news"); g.add_edge("summarise_news", "score_sentiment")
-    g.add_edge("fetch_news", "fetch_finance"); g.add_edge("fetch_finance", "analyse_finance")
+    # Define parallel branches
+    g.add_edge("fetch_news", "summarise_news")
+    g.add_edge("summarise_news", "score_sentiment")
+    g.add_edge("fetch_news", "fetch_finance")
+    g.add_edge("fetch_finance", "analyse_finance")
     
-    # --- FIX: Use conditional edges to wait for both branches to complete ---
-    g.add_conditional_edges(
-        "score_sentiment",
-        should_crosscheck,
-        {"crosscheck": "crosscheck", "wait": END}
-    )
-    g.add_conditional_edges(
-        "analyse_finance",
-        should_crosscheck,
-        {"crosscheck": "crosscheck", "wait": END}
-    )
+    # --- FIX: Use the simple, built-in method for joining branches ---
+    g.add_edge(["score_sentiment", "analyse_finance"], "crosscheck")
     
     g.add_edge("crosscheck", "aggregate")
     g.add_edge("aggregate", END)
@@ -181,8 +168,8 @@ def run_pipeline(tickers, start_date, end_date):
     initial_state = { "tickers": tickers, "start": start_date, "end": end_date, "errors": [] }
     return pipeline.invoke(initial_state)
 
+# --- The rest of the UI code is unchanged and correct ---
 st.sidebar.header("Analysis Configuration")
-# ... (The rest of the UI code is unchanged and correct) ...
 if 'available_tickers' not in st.session_state: st.session_state.available_tickers = ['NVDA', 'GOOGL', 'MSFT', 'AAPL', 'TSLA', 'AMZN', 'META']
 new_ticker = st.sidebar.text_input("Add Ticker Symbol", placeholder="e.g., CRM").strip().upper()
 if st.sidebar.button("Add Ticker"):
@@ -198,7 +185,8 @@ if st.sidebar.button("🚀 Run Analysis", type="primary"):
     if not selected_tickers: st.warning("Please select at least one ticker.")
     elif start_date >= end_date: st.warning("Start Date must be before End Date.")
     else:
-        with st.spinner("Analyzing... This may take a few minutes..."): st.session_state.final_state = run_pipeline(selected_tickers, start_date, end_date)
+        with st.spinner("Analyzing... This may take a few minutes..."):
+            st.session_state.final_state = run_pipeline(selected_tickers, start_date, end_date)
 
 if 'final_state' in st.session_state:
     state = st.session_state.final_state
