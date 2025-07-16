@@ -4,6 +4,7 @@ import json
 import datetime as dt
 from typing import Dict, List, Any
 import numpy as np
+import time # This is needed to prevent rate-limiting errors
 
 from dotenv import load_dotenv
 import pandas as pd
@@ -25,20 +26,14 @@ from huggingface_hub import InferenceClient
 CONFIG = {
     "max_articles_per_ticker": 5,
     "extractor_model": "gpt-4o",
-    "analyst_model": "gemini-2.5-pro",
+    "analyst_model": "gemini-1.5-pro",
     "sentiment_model_repo_id": "ProsusAI/finbert",
 }
 
 # --------  API KEYS & MODELS  --------
-# Caching is re-enabled for performance on the deployed app.
 @st.cache_resource
 def load_models_and_keys():
-    # Streamlit Cloud uses secrets management, not .env files.
-    # The load_dotenv() call is kept for local compatibility but is not needed for deployment.
     load_dotenv() 
-    
-    # In Streamlit Cloud, you set these as "Secrets" in the app settings.
-    # The keys will be loaded automatically as environment variables.
     keys = {
         "TAVILY_API_KEY": os.getenv("TAVILY_API_KEY"), 
         "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
@@ -128,6 +123,9 @@ def score_sentiment(articles, hf_api_key):
                 score = round(pmap.get("positive", 0) - pmap.get("negative", 0), 3)
                 article["sentiment_score"] = score
                 scores.append(score)
+                
+                # FIX 2: Add a 1-second delay to avoid rate limiting
+                time.sleep(1)
 
             except Exception as e:
                 st.warning(f"Could not score sentiment for article {i}: {e}")
@@ -162,7 +160,7 @@ def fetch_and_analyse_finance(ticker, start_date, end_date):
 
         finance_analysis = {
             "period_return_pct": float(round(n_day_return * 100, 2)),
-            # FIX 2: This pd.notna() check correctly handles the NaN case
+            # FIX 3: This robust check prevents the ambiguity error
             "largest_daily_move_pct": float(round(largest_move * 100, 2)) if pd.notna(largest_move) else 0.0
         }
         return df, finance_analysis
