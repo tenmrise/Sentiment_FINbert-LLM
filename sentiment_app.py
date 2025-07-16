@@ -25,13 +25,16 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 CONFIG = {
     "max_articles_per_ticker": 5,
     "extractor_model": "gpt-4o",
-    "analyst_model": "gemini-1.5-pro", # Note: Using a powerful model for analysis
+    "analyst_model": "gemini-2.5-pro",
     "sentiment_model_repo_id": "ProsusAI/finbert",
 }
 
 # --------  API KEYS & MODELS  --------
-@st.cache_resource
+# --- RADICAL DEBUGGING STEP: CACHE DISABLED ---
+# By commenting out the decorator, we force this function to run every time.
+# @st.cache_resource
 def load_models_and_keys():
+    st.info("Executing load_models_and_keys (caching is disabled)...") # Log to prove it's running
     load_dotenv()
     keys = {"TAVILY_API_KEY": os.getenv("TAVILY_API_KEY"), "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),"GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY"),"HUGGINGFACEHUB_API_TOKEN": os.getenv("HUGGINGFACEHUB_API_TOKEN")}
     if not all(keys.values()):
@@ -41,51 +44,40 @@ def load_models_and_keys():
         "search_tool": TavilySearchResults(max_results=CONFIG["max_articles_per_ticker"]),
         "fact_extractor_llm": ChatOpenAI(model=CONFIG["extractor_model"], temperature=0.0, api_key=keys["OPENAI_API_KEY"]),
         "analyst_llm": ChatGoogleGenerativeAI(model=CONFIG["analyst_model"], temperature=0.1, model_kwargs={"response_mime_type": "application/json"}, api_key=keys["GOOGLE_API_KEY"]),
-        # --- FIX 1: Explicitly set the correct task for the model ---
+        # FIX 1: This is the correct task for the sentiment model.
         "sentiment_analyzer": HuggingFaceEndpoint(
             repo_id=CONFIG["sentiment_model_repo_id"],
-            task="text-classification",  # This was changed from 'text-generation'
+            task="text-classification",
             huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"],
         )
     }
     return keys, models
 
-# -------- PROMPTS (With formatting fix) --------
-fact_extraction_prompt = ChatPromptTemplate.from_messages([("system", "You are a data extraction engine. From the provided news article text, extract the following information. Do not interpret, analyze, or add any information not present in the text. Your output must be a JSON object with the keys 'key_figures', 'core_event', and 'outlook'. If a key is not mentioned in the text, its value should be 'Not mentioned'."),("human", "Article Text:\n```{article_text}```")])
+# -------- PROMPTS (Shortened) --------
+fact_extraction_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a data extraction engine. From the provided news article text, extract the keys 'key_figures', 'core_event', and 'outlook'. Your output must be a valid JSON object. If a key is not mentioned, its value should be 'Not mentioned'."),
+    ("human", "Article Text:\n```{article_text}```")
+])
 
-# --- FIX 3: Cleaned up the prompt string to have valid variable names ---
-# The human message template was corrected to ensure variable names are clean.
 aggregate_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
         (
-            "You are a quantitative investment strategist. Your task is to synthesize three independent streams of pre-computed data: quantitative sentiment, extracted factual catalysts, and market price action. Your goal is to identify **divergence** or **convergence** between the news narrative and the stock's performance.\n\n"
-            "**Analytical Framework:**\n"
-            "1.  **Review Sentiment Profile:** Is the statistical sentiment profile Positive, Negative, or Contentious (high standard deviation)?\n"
-            "2.  **Review Factual Catalysts:** Do the extracted key facts represent clear positive or negative events?\n"
-            "3.  **Review Price Action:** Did the stock significantly outperform, underperform, or track the market?\n"
-            "4.  **Formulate Thesis:** Synthesize the three data streams. Is there a clear DIVERGENCE? (e.g., 'Despite a negative sentiment profile and no clear positive catalysts, the stock remained resilient, suggesting the market has already priced in known risks.') Or is there a CONVERGENCE? (e.g., 'Strong positive sentiment, driven by the new product launch, is confirmed by the stock's significant outperformance.')\n\n"
-            "**Output Schema (Strict JSON):**\n"
-            "```json\n"
-            "{\n"
-            "  \"ticker\": \"<The stock ticker>\",\n"
-            "  \"investment_thesis\": \"<Your concise thesis based on the divergence/convergence analysis>\",\n"
-            "  \"final_score\": <Integer from 1 to 10>,\n"
-            "  \"score_justification\": \"<1-sentence justification for your score, citing the thesis.>\"\n"
-            "}\n"
-            "```"
+            "You are a quantitative investment strategist. Your task is to analyze the provided data streams (sentiment, facts, price action) to find a core investment thesis based on their convergence or divergence. "
+            "Output your analysis in a strict JSON format with the keys: 'ticker', 'investment_thesis', 'final_score' (an integer from 1-10), and 'score_justification'."
         )
     ),
     (
         "human",
-        "Input Data for Ticker: {ticker}\n\n"
-        "**Quantitative Sentiment Profile:**\n```{sent_analysis}```\n\n"
-        "**Extracted Factual Catalysts:**\n```{key_facts}```\n\n"
-        "**Quantitative Price Action:**\n```{fin_analysis}```"
+        "**Ticker:** {ticker}\n"
+        "**Sentiment Analysis:**\n```{sent_analysis}```\n\n"
+        "**Factual Catalysts:**\n```{key_facts}```\n\n"
+        "**Price Action:**\n```{fin_analysis}```"
     )
 ])
 
-# -------- HELPER FUNCTIONS (With bug fixes) --------
+
+# -------- HELPER FUNCTIONS --------
 def fetch_news(ticker, start_date, end_date, search_tool):
     try:
         query = f"stock market news for {ticker} between {start_date:%Y-%m-%d} and {end_date:%Y-%m-%d}"
@@ -118,7 +110,8 @@ def score_sentiment(articles, sentiment_analyzer):
             if i < len(api_results):
                 pmap = {d["label"].lower(): d["score"] for d in api_results[i]}
                 score = round(pmap.get("positive", 0) - pmap.get("negative", 0), 3)
-                article["sentiment_score"] = score; scores.append(score)
+                article["sentiment_score"] = score
+                scores.append(score)
         if scores:
             sdf = pd.DataFrame(scores, columns=["score"])
             sentiment_analysis = {
@@ -132,7 +125,7 @@ def score_sentiment(articles, sentiment_analyzer):
             return articles, sentiment_analysis
         return articles, {}
     except Exception as e:
-        st.error(f"Error scoring sentiment: {e}")
+        st.error(f"Error in score_sentiment function: {e}")
         return articles, {}
 
 def fetch_and_analyse_finance(ticker, start_date, end_date):
@@ -142,9 +135,8 @@ def fetch_and_analyse_finance(ticker, start_date, end_date):
         if df.empty or len(df) < 2: raise ValueError("Not enough historical data found.")
         n_day_return = (df['Close'].iloc[-1] / df['Close'].iloc[0]) - 1
         largest_move = df['Close'].pct_change().abs().max()
-        
-        # --- FIX 2: Use pd.notna() to correctly check for a valid NaN value ---
-        # The original code failed here when largest_move was NaN.
+
+        # FIX 2: This is the robust way to handle a potential NaN value.
         finance_analysis = {
             "period_return_pct": float(round(n_day_return * 100, 2)),
             "largest_daily_move_pct": float(round(largest_move * 100, 2)) if pd.notna(largest_move) else 0.0
@@ -164,7 +156,9 @@ st.markdown("A dashboard for quantitative synthesis of news sentiment and price 
 api_keys, models = load_models_and_keys()
 if not models: st.stop()
 
-@st.cache_data(show_spinner=False)
+# --- RADICAL DEBUGGING STEP: CACHE DISABLED ---
+# By commenting out the decorator, we force this function to run every time.
+# @st.cache_data(show_spinner=False)
 def run_analysis_for_one_ticker(_models, _ticker, _start_date, _end_date):
     fact_extraction_chain = fact_extraction_prompt | _models['fact_extractor_llm'] | JsonOutputParser()
     aggregate_chain = aggregate_prompt | _models['analyst_llm'] | JsonOutputParser()
@@ -174,7 +168,6 @@ def run_analysis_for_one_ticker(_models, _ticker, _start_date, _end_date):
     price_df, finance_stats = fetch_and_analyse_finance(_ticker, _start_date, _end_date)
     key_facts_for_prompt = [a.get("key_facts", {}) for a in articles_with_sentiment]
     try:
-        # The dictionary keys here must exactly match the variables in the fixed aggregate_prompt
         final_report = aggregate_chain.invoke({
             "ticker": _ticker,
             "sent_analysis": json.dumps(sentiment_stats),
@@ -205,6 +198,7 @@ if st.sidebar.button("🚀 Run Analysis", type="primary"):
         st.session_state.all_results = []; results = []; status_container = st.empty(); progress_bar = st.progress(0)
         for i, ticker in enumerate(selected_tickers):
             status_container.info(f"▶️ Now analyzing: **{ticker}** ({i+1} of {len(selected_tickers)})...")
+            # Note: we call the raw function now, not the cached version
             result = run_analysis_for_one_ticker(models, ticker, start_date, end_date)
             results.append(result); progress_bar.progress((i + 1) / len(selected_tickers))
         status_container.success("✅ Analysis Complete!"); st.session_state.all_results = results
