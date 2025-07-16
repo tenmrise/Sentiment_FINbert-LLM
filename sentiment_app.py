@@ -4,7 +4,7 @@ import json
 import datetime as dt
 from typing import Dict, List, Any
 import numpy as np
-import time # This is needed to prevent rate-limiting errors
+import time # Needed for rate-limiting
 
 from dotenv import load_dotenv
 import pandas as pd
@@ -98,6 +98,7 @@ def extract_key_facts(articles, fact_extraction_chain):
         st.error(f"Error extracting facts: {e}")
         return articles
 
+# --- FINAL VERSION: Reads full article using chunking to avoid errors ---
 def score_sentiment(articles, hf_api_key):
     if not articles: return [], {}
     if not hf_api_key:
@@ -106,44 +107,61 @@ def score_sentiment(articles, hf_api_key):
     
     try:
         client = InferenceClient(token=hf_api_key)
-        scores = []
-        for i, article in enumerate(articles):
-            try:
-                text = (article.get("content") or art.get("title", ""))
-                if not text:
-                    article["sentiment_score"] = 0
-                    scores.append(0)
-                    continue
-                
-                # FIX 1: Truncate text to prevent the "Tensor Size" error
-                truncated_text = text[:800]
+        all_article_scores = []
 
-                result = client.text_classification(truncated_text, model=CONFIG["sentiment_model_repo_id"])
-                pmap = {d.label.lower(): d.score for d in result}
-                score = round(pmap.get("positive", 0) - pmap.get("negative", 0), 3)
-                article["sentiment_score"] = score
-                scores.append(score)
+        for i, article in enumerate(articles):
+            text = (article.get("content") or article.get("title", ""))
+            if not text:
+                article["sentiment_score"] = 0
+                all_article_scores.append(0)
+                continue
+
+            # Split the text by words and create chunks of a safe size
+            words = text.split()
+            chunk_size = 300 # Approx. 1200 characters, very safe for 512 token limit
+            chunks = [" ".join(words[j:j + chunk_size]) for j in range(0, len(words), chunk_size)]
+            
+            chunk_scores = []
+            try:
+                for chunk in chunks:
+                    if not chunk.strip(): continue
+                    
+                    result = client.text_classification(chunk, model=CONFIG["sentiment_model_repo_id"])
+                    pmap = {d.label.lower(): d.score for d in result}
+                    score = round(pmap.get("positive", 0) - pmap.get("negative", 0), 3)
+                    chunk_scores.append(score)
+                    
+                    # Add delay to avoid rate-limiting
+                    time.sleep(1) 
                 
-                # FIX 2: Add a 1-second delay to avoid rate limiting
-                time.sleep(1)
+                # The final score for the article is the average of its chunk scores
+                if chunk_scores:
+                    final_score = np.mean(chunk_scores)
+                else:
+                    final_score = 0
+
+                article["sentiment_score"] = round(final_score, 3)
+                all_article_scores.append(final_score)
 
             except Exception as e:
-                st.warning(f"Could not score sentiment for article {i}: {e}")
+                st.warning(f"Could not score sentiment for chunks in article {i}: {e}")
                 article["sentiment_score"] = 0
-                scores.append(0)
+                all_article_scores.append(0)
 
-        if scores:
-            sdf = pd.DataFrame(scores, columns=["score"])
+        if all_article_scores:
+            sdf = pd.DataFrame(all_article_scores, columns=["score"])
             sentiment_analysis = {
                 "average_score": float(sdf["score"].mean()),
-                "std_dev_sentiment": float(sdf["score"].std()) if len(scores) > 1 else 0.0,
-                "num_articles": len(scores),
+                "std_dev_sentiment": float(sdf["score"].std()) if len(all_article_scores) > 1 else 0.0,
+                "num_articles": len(all_article_scores),
                 "num_positive": int(sdf[sdf["score"] > 0.1].count().iloc[0]),
                 "num_negative": int(sdf[sdf["score"] < -0.1].count().iloc[0]),
                 "num_neutral": int(sdf[(sdf["score"] >= -0.1) & (sdf["score"] <= 0.1)].count().iloc[0])
             }
             return articles, sentiment_analysis
+        
         return articles, {}
+
     except Exception as e:
         st.error(f"A critical error occurred in the sentiment scoring function: {e}")
         return articles, {}
@@ -160,7 +178,7 @@ def fetch_and_analyse_finance(ticker, start_date, end_date):
 
         finance_analysis = {
             "period_return_pct": float(round(n_day_return * 100, 2)),
-            # FIX 3: This robust check prevents the ambiguity error
+            # This robust check prevents the ambiguity error
             "largest_daily_move_pct": float(round(largest_move * 100, 2)) if pd.notna(largest_move) else 0.0
         }
         return df, finance_analysis
@@ -173,7 +191,7 @@ def fetch_and_analyse_finance(ticker, start_date, end_date):
 # ==============================================================================
 st.set_page_config(layout="wide", page_title="Financial Sentiment Dashboard")
 st.title("📈 Financial News & Sentiment Analysis")
-st.markdown(" Quantitative synthesis of news sentiment and price action, powered by LLM agents.")
+st.markdown("A dashboard for quantitative synthesis of news sentiment and price action, powered by LLM agents.")
 
 api_keys, models = load_models_and_keys()
 if not models: st.stop()
