@@ -116,7 +116,7 @@ def score_sentiment(articles, hf_api_key):
                     continue
                 
                 # FIX 1: Truncate text to prevent the "Tensor Size" error
-                truncated_text = text[:1000]
+                truncated_text = text[:800]
 
                 result = client.text_classification(truncated_text, model=CONFIG["sentiment_model_repo_id"])
                 pmap = {d.label.lower(): d.score for d in result}
