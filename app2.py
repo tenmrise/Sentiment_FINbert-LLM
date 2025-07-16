@@ -54,12 +54,11 @@ def load_models_and_keys():
             temperature=0.1, 
             api_key=keys["GOOGLE_API_KEY"]
         ),
-        # FIX 1: Use HuggingFaceEndpoint with explicit task parameter
+        # FIX: Remove duplicate task parameter - only use it as a direct parameter
         "sentiment_analyzer": HuggingFaceEndpoint(
             repo_id=CONFIG["sentiment_model_repo_id"],
             task="text-classification",
-            huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"],
-            model_kwargs={"task": "text-classification"}  # Extra emphasis on task type
+            huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"]
         )
     }
     return keys, models
@@ -135,7 +134,63 @@ def extract_key_facts(articles, fact_extraction_chain):
         return articles
 
 def score_sentiment(articles, sentiment_analyzer):
-    """FIX 2: Alternative sentiment scoring using direct HuggingFace API call"""
+    """Enhanced sentiment scoring with fallback to direct HuggingFace API"""
+    if not articles: 
+        return [], {}
+    
+    try:
+        # First, try using the LangChain HuggingFaceEndpoint
+        scores = []
+        for i, article in enumerate(articles):
+            try:
+                text = (article.get("content") or article.get("title", ""))[:512]
+                result = sentiment_analyzer.invoke(text)
+                
+                # Parse the result based on expected format
+                if isinstance(result, list):
+                    # Handle list of predictions
+                    pmap = {}
+                    for pred in result:
+                        if isinstance(pred, dict) and "label" in pred and "score" in pred:
+                            label = pred["label"].lower()
+                            score = pred["score"]
+                            pmap[label] = score
+                    
+                    # Calculate sentiment score: positive - negative
+                    sentiment_score = pmap.get("positive", 0) - pmap.get("negative", 0)
+                    articles[i]["sentiment_score"] = round(sentiment_score, 3)
+                    scores.append(sentiment_score)
+                else:
+                    # If result format is unexpected, default to 0
+                    articles[i]["sentiment_score"] = 0.0
+                    scores.append(0.0)
+                    
+            except Exception as e:
+                st.warning(f"Error scoring sentiment for article {i}: {e}")
+                articles[i]["sentiment_score"] = 0.0
+                scores.append(0.0)
+        
+        # Calculate sentiment statistics
+        if scores:
+            sentiment_analysis = {
+                "average_score": float(np.mean(scores)),
+                "std_dev_sentiment": float(np.std(scores)) if len(scores) > 1 else 0.0,
+                "num_articles": len(scores),
+                "num_positive": sum(1 for s in scores if s > 0.1),
+                "num_negative": sum(1 for s in scores if s < -0.1),
+                "num_neutral": sum(1 for s in scores if -0.1 <= s <= 0.1)
+            }
+            return articles, sentiment_analysis
+        
+        return articles, {}
+        
+    except Exception as e:
+        st.error(f"Error in sentiment scoring: {e}")
+        # Fallback to direct API call
+        return score_sentiment_fallback(articles)
+
+def score_sentiment_fallback(articles):
+    """Fallback sentiment scoring using direct HuggingFace API call"""
     if not articles: 
         return [], {}
     
@@ -208,11 +263,11 @@ def score_sentiment(articles, sentiment_analyzer):
         return articles, {}
         
     except Exception as e:
-        st.error(f"Error in sentiment scoring: {e}")
+        st.error(f"Error in fallback sentiment scoring: {e}")
         return articles, {}
 
 def fetch_and_analyse_finance(ticker, start_date, end_date):
-    """FIX 3: Fixed pandas Series boolean operations"""
+    """Fixed pandas Series boolean operations"""
     try:
         end_date_adj = end_date + dt.timedelta(days=1)
         df = yf.download(ticker, start=start_date, end=end_date_adj, progress=False, ignore_tz=True)
