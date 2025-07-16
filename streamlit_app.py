@@ -3,22 +3,24 @@ import os
 import json
 import datetime as dt
 from typing import Dict, List, Any
+import numpy as np # Import numpy for data type conversion
 
 from dotenv import load_dotenv
 import pandas as pd
 import yfinance as yf
 import plotly.express as px
 
-# LangChain imports WITHOUT LangGraph
+# LangChain imports
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
+from langchain_core.output_parsers import JsonOutputParser
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEndpoint
-from langchain_community.utilities.google_serper import GoogleSerperAPIWrapper
+# --- CHANGE: Import the new, reliable search tool ---
+from langchain_community.tools.tavily_search import TavilySearchResults
 
 # ==============================================================================
-# 1. CORE APPLICATION LOGIC (LangGraph-Free)
+# 1. CORE APPLICATION LOGIC
 # ==============================================================================
 
 # --------  CONFIG  --------
@@ -33,11 +35,12 @@ CONFIG = {
 @st.cache_resource
 def load_models_and_keys():
     load_dotenv()
-    keys = {"SERPER_API_KEY": os.getenv("SERPER_API_KEY"),"OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),"GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY"),"HUGGINGFACEHUB_API_TOKEN": os.getenv("HUGGINGFACEHUB_API_TOKEN")}
+    keys = {"TAVILY_API_KEY": os.getenv("TAVILY_API_KEY"), "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),"GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY"),"HUGGINGFACEHUB_API_TOKEN": os.getenv("HUGGINGFACEHUB_API_TOKEN")}
     if not all(keys.values()):
-        st.error("API Key Missing! Ensure SERPER, OPENAI, GOOGLE, and HUGGINGFACEHUB keys are in secrets.")
+        st.error("API Key Missing! Ensure TAVILY, OPENAI, GOOGLE, and HUGGINGFACEHUB keys are in secrets.")
         return None, None
     models = {
+        "search_tool": TavilySearchResults(max_results=CONFIG["max_articles_per_ticker"]),
         "fact_extractor_llm": ChatOpenAI(model=CONFIG["extractor_model"], temperature=0.0, api_key=keys["OPENAI_API_KEY"]),
         "analyst_llm": ChatGoogleGenerativeAI(model=CONFIG["analyst_model"], temperature=0.1, model_kwargs={"response_mime_type": "application/json"}, api_key=keys["GOOGLE_API_KEY"]),
         "sentiment_analyzer": HuggingFaceEndpoint(repo_id=CONFIG["sentiment_model_repo_id"], task="text-classification", huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"])
@@ -48,14 +51,16 @@ def load_models_and_keys():
 fact_extraction_prompt = ChatPromptTemplate.from_messages([("system", "You are a data extraction engine. From the provided news article text, extract the following information. Do not interpret, analyze, or add any information not present in the text. Your output must be a JSON object with the keys 'key_figures', 'core_event', and 'outlook'. If a key is not mentioned in the text, its value should be 'Not mentioned'."),("human", "Article Text:\n```{article_text}```")])
 aggregate_prompt = ChatPromptTemplate.from_messages([("system", "You are a quantitative investment strategist. Your task is to synthesize three independent streams of pre-computed data: quantitative sentiment, extracted factual catalysts, and market price action. Your goal is to identify **divergence** or **convergence** between the news narrative and the stock's performance.\n\n**Analytical Framework:**\n1.  **Review Sentiment Profile:** Is the statistical sentiment profile Positive, Negative, or Contentious (high standard deviation)?\n2.  **Review Factual Catalysts:** Do the extracted key facts represent clear positive or negative events?\n3.  **Review Price Action:** Did the stock significantly outperform, underperform, or track the market?\n4.  **Formulate Thesis:** Synthesize the three data streams. Is there a clear DIVERGENCE? (e.g., 'Despite a negative sentiment profile and no clear positive catalysts, the stock remained resilient, suggesting the market has already priced in known risks.') Or is there a CONVERGENCE? (e.g., 'Strong positive sentiment, driven by the new product launch, is confirmed by the stock's significant outperformance.')\n\n**Output Schema (Strict JSON):**\n```json\n{\n  \"ticker\": \"<The stock ticker>\",\n  \"investment_thesis\": \"<Your concise thesis based on the divergence/convergence analysis>\",\n  \"final_score\": <Integer from 1 to 10>,\n  \"score_justification\": \"<1-sentence justification for your score, citing the thesis.>\"\n}\n```"),("human","Input Data for Ticker: {ticker}\n\n**Quantitative Sentiment Profile:**\n```{sent_analysis}```\n\n**Extracted Factual Catalysts:**\n```{key_facts}```\n\n**Quantitative Price Action:**\n```{fin_analysis}```")])
 
-# -------- HELPER FUNCTIONS (No longer LangGraph nodes) --------
-def fetch_news(ticker, start_date, end_date):
+# -------- HELPER FUNCTIONS (Updated to use Tavily) --------
+def fetch_news(ticker, start_date, end_date, search_tool):
     try:
-        serper = GoogleSerperAPIWrapper(type_="news")
-        query = f"\"{ticker}\" stock news after:{start_date:%Y-%m-%d} before:{end_date:%Y-%m-%d}"
-        result = serper.run(query)
-        if not result or not result.strip(): return []
-        return json.loads(result).get("news", [])[:CONFIG["max_articles_per_ticker"]]
+        # Tavily works better with a simple query format
+        query = f"stock news for {ticker}"
+        # Tavily returns a list of dictionaries directly
+        articles = search_tool.invoke(query)
+        # We need to rename the keys to match our app's expectations
+        renamed_articles = [{"title": art["title"], "snippet": art["content"], "link": art["url"]} for art in articles]
+        return renamed_articles
     except Exception as e:
         st.error(f"Error fetching news for {ticker}: {e}")
         return []
@@ -70,7 +75,7 @@ def extract_key_facts(articles, fact_extraction_chain):
         return articles
     except Exception as e:
         st.error(f"Error extracting facts: {e}")
-        return articles # Return original articles even if facts fail
+        return articles
 
 def score_sentiment(articles, sentiment_analyzer):
     if not articles: return [], {}
@@ -86,7 +91,15 @@ def score_sentiment(articles, sentiment_analyzer):
         
         if scores:
             sdf = pd.DataFrame(scores, columns=["score"])
-            sentiment_analysis = {"average_score": round(sdf["score"].mean(), 3), "std_dev_sentiment": round(sdf["score"].std(), 3) if len(scores) > 1 else 0, "num_articles": len(scores), "num_positive": int(sdf[sdf["score"] > 0.1].count().iloc[0]), "num_negative": int(sdf[sdf["score"] < -0.1].count().iloc[0]), "num_neutral": int(sdf[(sdf["score"] >= -0.1) & (sdf["score"] <= 0.1)].count().iloc[0])}
+            # FIX: Ensure all values are standard Python types
+            sentiment_analysis = {
+                "average_score": float(sdf["score"].mean()),
+                "std_dev_sentiment": float(sdf["score"].std()) if len(scores) > 1 else 0.0,
+                "num_articles": len(scores),
+                "num_positive": int(sdf[sdf["score"] > 0.1].count().iloc[0]),
+                "num_negative": int(sdf[sdf["score"] < -0.1].count().iloc[0]),
+                "num_neutral": int(sdf[(sdf["score"] >= -0.1) & (sdf["score"] <= 0.1)].count().iloc[0])
+            }
             return articles, sentiment_analysis
         return articles, {}
     except Exception as e:
@@ -100,7 +113,11 @@ def fetch_and_analyse_finance(ticker, start_date, end_date):
         if df.empty or len(df) < 2: raise ValueError("Not enough historical data found.")
         n_day_return = (df['Close'].iloc[-1] / df['Close'].iloc[0]) - 1
         largest_move = df['Close'].pct_change().abs().max()
-        finance_analysis = {"period_return_pct": round(n_day_return * 100, 2), "largest_daily_move_pct": round(largest_move * 100, 2)}
+        # FIX: Ensure all values are standard Python types
+        finance_analysis = {
+            "period_return_pct": float(round(n_day_return * 100, 2)),
+            "largest_daily_move_pct": float(round(largest_move * 100, 2)) if pd.notna(largest_move) else 0.0
+        }
         return df, finance_analysis
     except Exception as e:
         st.error(f"Error analyzing finance for {ticker}: {e}")
@@ -116,14 +133,13 @@ st.markdown("A dashboard for quantitative synthesis of news sentiment and price 
 api_keys, models = load_models_and_keys()
 if not models: st.stop()
 
-# --- The Main Orchestration Function (LangGraph-Free) ---
+# --- The Main Orchestration Function ---
 @st.cache_data(show_spinner=False)
 def run_analysis_for_one_ticker(_models, _ticker, _start_date, _end_date):
     fact_extraction_chain = fact_extraction_prompt | _models['fact_extractor_llm'] | JsonOutputParser()
     aggregate_chain = aggregate_prompt | _models['analyst_llm'] | JsonOutputParser()
 
-    # Simple, sequential execution
-    articles = fetch_news(_ticker, _start_date, _end_date)
+    articles = fetch_news(_ticker, _start_date, _end_date, _models['search_tool'])
     articles_with_facts = extract_key_facts(articles, fact_extraction_chain)
     articles_with_sentiment, sentiment_stats = score_sentiment(articles_with_facts, _models['sentiment_analyzer'])
     price_df, finance_stats = fetch_and_analyse_finance(_ticker, _start_date, _end_date)
@@ -169,7 +185,7 @@ if st.sidebar.button("🚀 Run Analysis", type="primary"):
         st.session_state.all_results = []; results = []; status_container = st.empty(); progress_bar = st.progress(0)
         for i, ticker in enumerate(selected_tickers):
             status_container.info(f"▶️ Now analyzing: **{ticker}** ({i+1} of {len(selected_tickers)})...")
-            result = run_analysis_for_one_ticker(models, ticker, start_date, end_date) # Corrected function call
+            result = run_analysis_for_one_ticker(models, ticker, start_date, end_date)
             results.append(result); progress_bar.progress((i + 1) / len(selected_tickers))
         status_container.success("✅ Analysis Complete!"); st.session_state.all_results = results
 
@@ -211,9 +227,9 @@ if 'all_results' in st.session_state and st.session_state.all_results:
                 if not news_data: st.info(f"No news articles found.")
                 for item in news_data:
                     score = item.get('sentiment_score', 0); color = "green" if score > 0 else "red" if score < 0 else "blue"
-                    with st.expander(f"**{item.get('published', 'Date N/A')}** | Score: :{color}[{score:.3f}]"):
-                        st.write("**Original Snippet:**"); st.write(item.get('snippet'))
+                    with st.expander(f"**{item.get('title', 'Article')}** | Score: :{color}[{score:.3f}]"):
                         st.write("**Key Facts Extracted by LLM:**"); st.json(item.get('key_facts', 'No facts extracted.'))
+                        st.write("**Original Content:**"); st.write(item.get('snippet'))
                         st.link_button("Go to Article", item.get("link", "#"))
 else:
     st.info("Configure your analysis in the sidebar and click 'Run Analysis' to begin.")
