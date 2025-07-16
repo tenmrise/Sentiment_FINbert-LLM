@@ -14,8 +14,11 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEndpoint
+# NOTE: We no longer need langchain_huggingface
 from langchain_community.tools.tavily_search import TavilySearchResults
+
+# --- NEW IMPORT: Using the direct Hugging Face library as you suggested ---
+from huggingface_hub import InferenceClient
 
 # ==============================================================================
 # 1. CORE APPLICATION LOGIC
@@ -26,30 +29,23 @@ CONFIG = {
     "max_articles_per_ticker": 5,
     "extractor_model": "gpt-4o",
     "analyst_model": "gemini-2.5-pro",
-    "sentiment_model_repo_id": "ProsusAI/finbert",
+    "sentiment_model_repo_id": "ProsusAI/finbert", # Using the correct financial model
 }
 
 # --------  API KEYS & MODELS  --------
-# --- RADICAL DEBUGGING STEP: CACHE DISABLED ---
-# By commenting out the decorator, we force this function to run every time.
-# @st.cache_resource
+@st.cache_resource
 def load_models_and_keys():
-    st.info("Executing load_models_and_keys (caching is disabled)...") # Log to prove it's running
     load_dotenv()
     keys = {"TAVILY_API_KEY": os.getenv("TAVILY_API_KEY"), "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),"GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY"),"HUGGINGFACEHUB_API_TOKEN": os.getenv("HUGGINGFACEHUB_API_TOKEN")}
     if not all(keys.values()):
         st.error("API Key Missing! Ensure TAVILY, OPENAI, GOOGLE, and HUGGINGFACEHUB keys are in secrets.")
         return None, None
+    
+    # --- The sentiment analyzer is now created directly in the scoring function ---
     models = {
         "search_tool": TavilySearchResults(max_results=CONFIG["max_articles_per_ticker"]),
         "fact_extractor_llm": ChatOpenAI(model=CONFIG["extractor_model"], temperature=0.0, api_key=keys["OPENAI_API_KEY"]),
         "analyst_llm": ChatGoogleGenerativeAI(model=CONFIG["analyst_model"], temperature=0.1, model_kwargs={"response_mime_type": "application/json"}, api_key=keys["GOOGLE_API_KEY"]),
-        # FIX 1: This is the correct task for the sentiment model.
-        "sentiment_analyzer": HuggingFaceEndpoint(
-            repo_id=CONFIG["sentiment_model_repo_id"],
-            task="text-classification",
-            huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"],
-        )
     }
     return keys, models
 
@@ -100,18 +96,37 @@ def extract_key_facts(articles, fact_extraction_chain):
         st.error(f"Error extracting facts: {e}")
         return articles
 
-def score_sentiment(articles, sentiment_analyzer):
-    if not articles: return [], {}
+# --- RE-ENGINEERED SENTIMENT FUNCTION USING YOUR DIRECT API METHOD ---
+def score_sentiment(articles, hf_api_key):
+    if not articles:
+        return [], {}
+    
+    st.info("Scoring sentiment using direct Hugging Face Inference API...")
+    
     try:
-        texts_to_score = [(art.get("content") or art.get("title", "")) for art in articles]
-        api_results = sentiment_analyzer.batch(texts_to_score)
+        client = InferenceClient(token=hf_api_key)
         scores = []
-        for i, article in enumerate(articles):
-            if i < len(api_results):
-                pmap = {d["label"].lower(): d["score"] for d in api_results[i]}
+        texts_to_score = [(art.get("content") or art.get("title", "")) for art in articles]
+
+        for i, text in enumerate(texts_to_score):
+            try:
+                # Direct API call for text classification
+                result = client.text_classification(
+                    text,
+                    model=CONFIG["sentiment_model_repo_id"]
+                )
+                
+                # Parse the direct API result
+                pmap = {d.label.lower(): d.score for d in result}
                 score = round(pmap.get("positive", 0) - pmap.get("negative", 0), 3)
-                article["sentiment_score"] = score
+                articles[i]["sentiment_score"] = score
                 scores.append(score)
+
+            except Exception as e:
+                st.warning(f"Could not score sentiment for article {i}: {e}")
+                articles[i]["sentiment_score"] = 0
+                scores.append(0)
+
         if scores:
             sdf = pd.DataFrame(scores, columns=["score"])
             sentiment_analysis = {
@@ -123,9 +138,11 @@ def score_sentiment(articles, sentiment_analyzer):
                 "num_neutral": int(sdf[(sdf["score"] >= -0.1) & (sdf["score"] <= 0.1)].count().iloc[0])
             }
             return articles, sentiment_analysis
+        
         return articles, {}
+    
     except Exception as e:
-        st.error(f"Error in score_sentiment function: {e}")
+        st.error(f"A critical error occurred in the sentiment scoring function: {e}")
         return articles, {}
 
 def fetch_and_analyse_finance(ticker, start_date, end_date):
@@ -136,7 +153,6 @@ def fetch_and_analyse_finance(ticker, start_date, end_date):
         n_day_return = (df['Close'].iloc[-1] / df['Close'].iloc[0]) - 1
         largest_move = df['Close'].pct_change().abs().max()
 
-        # FIX 2: This is the robust way to handle a potential NaN value.
         finance_analysis = {
             "period_return_pct": float(round(n_day_return * 100, 2)),
             "largest_daily_move_pct": float(round(largest_move * 100, 2)) if pd.notna(largest_move) else 0.0
@@ -156,15 +172,16 @@ st.markdown("A dashboard for quantitative synthesis of news sentiment and price 
 api_keys, models = load_models_and_keys()
 if not models: st.stop()
 
-# --- RADICAL DEBUGGING STEP: CACHE DISABLED ---
-# By commenting out the decorator, we force this function to run every time.
-# @st.cache_data(show_spinner=False)
-def run_analysis_for_one_ticker(_models, _ticker, _start_date, _end_date):
+@st.cache_data(show_spinner=False)
+def run_analysis_for_one_ticker(_models, _keys, _ticker, _start_date, _end_date):
     fact_extraction_chain = fact_extraction_prompt | _models['fact_extractor_llm'] | JsonOutputParser()
     aggregate_chain = aggregate_prompt | _models['analyst_llm'] | JsonOutputParser()
     articles = fetch_news(_ticker, _start_date, _end_date, _models['search_tool'])
     articles_with_facts = extract_key_facts(articles, fact_extraction_chain)
-    articles_with_sentiment, sentiment_stats = score_sentiment(articles_with_facts, _models['sentiment_analyzer'])
+    
+    # --- Pass the HF API key to the new sentiment function ---
+    articles_with_sentiment, sentiment_stats = score_sentiment(articles_with_facts, _keys['HUGGINGFACEHUB_API_TOKEN'])
+    
     price_df, finance_stats = fetch_and_analyse_finance(_ticker, _start_date, _end_date)
     key_facts_for_prompt = [a.get("key_facts", {}) for a in articles_with_sentiment]
     try:
@@ -192,14 +209,17 @@ start_date = st.sidebar.date_input("Start Date", value=today - dt.timedelta(days
 end_date = st.sidebar.date_input("End Date", value=today)
 
 if st.sidebar.button("🚀 Run Analysis", type="primary"):
+    # This is the last time you should need to do this.
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    
     if not selected_tickers: st.warning("Please select at least one ticker.")
     elif start_date >= end_date: st.warning("Start Date must be before End Date.")
     else:
         st.session_state.all_results = []; results = []; status_container = st.empty(); progress_bar = st.progress(0)
         for i, ticker in enumerate(selected_tickers):
             status_container.info(f"▶️ Now analyzing: **{ticker}** ({i+1} of {len(selected_tickers)})...")
-            # Note: we call the raw function now, not the cached version
-            result = run_analysis_for_one_ticker(models, ticker, start_date, end_date)
+            result = run_analysis_for_one_ticker(models, api_keys, ticker, start_date, end_date)
             results.append(result); progress_bar.progress((i + 1) / len(selected_tickers))
         status_container.success("✅ Analysis Complete!"); st.session_state.all_results = results
 
