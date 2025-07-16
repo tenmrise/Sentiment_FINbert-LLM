@@ -14,10 +14,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
-# NOTE: We no longer need langchain_huggingface
 from langchain_community.tools.tavily_search import TavilySearchResults
-
-# --- NEW IMPORT: Using the direct Hugging Face library as you suggested ---
 from huggingface_hub import InferenceClient
 
 # ==============================================================================
@@ -28,28 +25,38 @@ from huggingface_hub import InferenceClient
 CONFIG = {
     "max_articles_per_ticker": 5,
     "extractor_model": "gpt-4o",
-    "analyst_model": "gemini-2.5-pro",
-    "sentiment_model_repo_id": "ProsusAI/finbert", # Using the correct financial model
+    "analyst_model": "gemini-1.5-pro",
+    "sentiment_model_repo_id": "ProsusAI/finbert",
 }
 
 # --------  API KEYS & MODELS  --------
+# Caching is re-enabled for performance on the deployed app.
 @st.cache_resource
 def load_models_and_keys():
-    load_dotenv()
-    keys = {"TAVILY_API_KEY": os.getenv("TAVILY_API_KEY"), "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),"GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY"),"HUGGINGFACEHUB_API_TOKEN": os.getenv("HUGGINGFACEHUB_API_TOKEN")}
+    # Streamlit Cloud uses secrets management, not .env files.
+    # The load_dotenv() call is kept for local compatibility but is not needed for deployment.
+    load_dotenv() 
+    
+    # In Streamlit Cloud, you set these as "Secrets" in the app settings.
+    # The keys will be loaded automatically as environment variables.
+    keys = {
+        "TAVILY_API_KEY": os.getenv("TAVILY_API_KEY"), 
+        "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
+        "GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY"),
+        "HUGGINGFACEHUB_API_TOKEN": os.getenv("HUGGINGFACEHUB_API_TOKEN")
+    }
     if not all(keys.values()):
-        st.error("API Key Missing! Ensure TAVILY, OPENAI, GOOGLE, and HUGGINGFACEHUB keys are in secrets.")
+        st.error("API Secrets Missing! Please configure all required secrets in your Streamlit Cloud app settings.")
         return None, None
     
-    # --- The sentiment analyzer is now created directly in the scoring function ---
     models = {
-        "search_tool": TavilySearchResults(max_results=CONFIG["max_articles_per_ticker"]),
+        "search_tool": TavilySearchResults(max_results=CONFIG["max_articles_per_ticker"], api_key=keys["TAVILY_API_KEY"]),
         "fact_extractor_llm": ChatOpenAI(model=CONFIG["extractor_model"], temperature=0.0, api_key=keys["OPENAI_API_KEY"]),
         "analyst_llm": ChatGoogleGenerativeAI(model=CONFIG["analyst_model"], temperature=0.1, model_kwargs={"response_mime_type": "application/json"}, api_key=keys["GOOGLE_API_KEY"]),
     }
     return keys, models
 
-# -------- PROMPTS (Shortened) --------
+# -------- PROMPTS --------
 fact_extraction_prompt = ChatPromptTemplate.from_messages([
     ("system", "You are a data extraction engine. From the provided news article text, extract the keys 'key_figures', 'core_event', and 'outlook'. Your output must be a valid JSON object. If a key is not mentioned, its value should be 'Not mentioned'."),
     ("human", "Article Text:\n```{article_text}```")
@@ -96,35 +103,35 @@ def extract_key_facts(articles, fact_extraction_chain):
         st.error(f"Error extracting facts: {e}")
         return articles
 
-# --- RE-ENGINEERED SENTIMENT FUNCTION USING YOUR DIRECT API METHOD ---
 def score_sentiment(articles, hf_api_key):
-    if not articles:
-        return [], {}
-    
-    st.info("Scoring sentiment using direct Hugging Face Inference API...")
+    if not articles: return [], {}
+    if not hf_api_key:
+        st.error("Hugging Face API key not found for sentiment scoring.")
+        return articles, {}
     
     try:
         client = InferenceClient(token=hf_api_key)
         scores = []
-        texts_to_score = [(art.get("content") or art.get("title", "")) for art in articles]
-
-        for i, text in enumerate(texts_to_score):
+        for i, article in enumerate(articles):
             try:
-                # Direct API call for text classification
-                result = client.text_classification(
-                    text,
-                    model=CONFIG["sentiment_model_repo_id"]
-                )
+                text = (article.get("content") or article.get("title", ""))
+                if not text:
+                    article["sentiment_score"] = 0
+                    scores.append(0)
+                    continue
                 
-                # Parse the direct API result
+                # FIX 1: Truncate text to prevent the "Tensor Size" error
+                truncated_text = text[:2000]
+
+                result = client.text_classification(truncated_text, model=CONFIG["sentiment_model_repo_id"])
                 pmap = {d.label.lower(): d.score for d in result}
                 score = round(pmap.get("positive", 0) - pmap.get("negative", 0), 3)
-                articles[i]["sentiment_score"] = score
+                article["sentiment_score"] = score
                 scores.append(score)
 
             except Exception as e:
                 st.warning(f"Could not score sentiment for article {i}: {e}")
-                articles[i]["sentiment_score"] = 0
+                article["sentiment_score"] = 0
                 scores.append(0)
 
         if scores:
@@ -138,9 +145,7 @@ def score_sentiment(articles, hf_api_key):
                 "num_neutral": int(sdf[(sdf["score"] >= -0.1) & (sdf["score"] <= 0.1)].count().iloc[0])
             }
             return articles, sentiment_analysis
-        
         return articles, {}
-    
     except Exception as e:
         st.error(f"A critical error occurred in the sentiment scoring function: {e}")
         return articles, {}
@@ -149,18 +154,21 @@ def fetch_and_analyse_finance(ticker, start_date, end_date):
     try:
         end_date_adj = end_date + dt.timedelta(days=1)
         df = yf.download(ticker, start=start_date, end=end_date_adj, progress=False, ignore_tz=True)
-        if df.empty or len(df) < 2: raise ValueError("Not enough historical data found.")
+        if df.empty or len(df) < 2: 
+            return pd.DataFrame(), {"period_return_pct": 0.0, "largest_daily_move_pct": 0.0}
+        
         n_day_return = (df['Close'].iloc[-1] / df['Close'].iloc[0]) - 1
         largest_move = df['Close'].pct_change().abs().max()
 
         finance_analysis = {
             "period_return_pct": float(round(n_day_return * 100, 2)),
+            # FIX 2: This pd.notna() check correctly handles the NaN case
             "largest_daily_move_pct": float(round(largest_move * 100, 2)) if pd.notna(largest_move) else 0.0
         }
         return df, finance_analysis
     except Exception as e:
         st.error(f"Error analyzing finance for {ticker}: {e}")
-        return pd.DataFrame(), {}
+        return pd.DataFrame(), {"period_return_pct": 0.0, "largest_daily_move_pct": 0.0}
 
 # ==============================================================================
 # 2. STREAMLIT DASHBOARD UI
@@ -178,10 +186,7 @@ def run_analysis_for_one_ticker(_models, _keys, _ticker, _start_date, _end_date)
     aggregate_chain = aggregate_prompt | _models['analyst_llm'] | JsonOutputParser()
     articles = fetch_news(_ticker, _start_date, _end_date, _models['search_tool'])
     articles_with_facts = extract_key_facts(articles, fact_extraction_chain)
-    
-    # --- Pass the HF API key to the new sentiment function ---
     articles_with_sentiment, sentiment_stats = score_sentiment(articles_with_facts, _keys['HUGGINGFACEHUB_API_TOKEN'])
-    
     price_df, finance_stats = fetch_and_analyse_finance(_ticker, _start_date, _end_date)
     key_facts_for_prompt = [a.get("key_facts", {}) for a in articles_with_sentiment]
     try:
@@ -196,6 +201,7 @@ def run_analysis_for_one_ticker(_models, _keys, _ticker, _start_date, _end_date)
         final_report = None
     return {"ticker": _ticker, "report": final_report, "news_data": articles_with_sentiment, "finance_analysis": finance_stats, "prices_raw": price_df}
 
+# --- The rest of the UI code is standard and correct ---
 st.sidebar.header("Analysis Configuration")
 if 'available_tickers' not in st.session_state: st.session_state.available_tickers = ['NVDA', 'GOOGL', 'MSFT', 'AAPL']
 new_ticker = st.sidebar.text_input("Add Ticker Symbol", placeholder="e.g., CRM").strip().upper()
@@ -209,10 +215,6 @@ start_date = st.sidebar.date_input("Start Date", value=today - dt.timedelta(days
 end_date = st.sidebar.date_input("End Date", value=today)
 
 if st.sidebar.button("🚀 Run Analysis", type="primary"):
-    # This is the last time you should need to do this.
-    st.cache_data.clear()
-    st.cache_resource.clear()
-    
     if not selected_tickers: st.warning("Please select at least one ticker.")
     elif start_date >= end_date: st.warning("Start Date must be before End Date.")
     else:
