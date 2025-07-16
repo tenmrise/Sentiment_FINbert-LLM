@@ -173,7 +173,7 @@ def fetch_and_analyse_finance(ticker, start_date, end_date):
 # ==============================================================================
 st.set_page_config(layout="wide", page_title="Financial Sentiment Dashboard")
 st.title("📈 Financial News & Sentiment Analysis")
-st.markdown("A dashboard for quantitative synthesis of news sentiment and price action, powered by LLM agents.")
+st.markdown(" Quantitative synthesis of news sentiment and price action, powered by LLM agents.")
 
 api_keys, models = load_models_and_keys()
 if not models: st.stop()
