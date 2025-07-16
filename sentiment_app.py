@@ -26,7 +26,7 @@ from huggingface_hub import InferenceClient
 CONFIG = {
     "max_articles_per_ticker": 5,
     "extractor_model": "gpt-4o",
-    "analyst_model": "gemini-2.5-pro",
+    "analyst_model": "gemini-1.5-pro",
     "sentiment_model_repo_id": "ProsusAI/finbert",
 }
 
@@ -109,7 +109,7 @@ def score_sentiment(articles, hf_api_key):
         scores = []
         for i, article in enumerate(articles):
             try:
-                text = (article.get("content") or article.get("title", ""))
+                text = (article.get("content") or art.get("title", ""))
                 if not text:
                     article["sentiment_score"] = 0
                     scores.append(0)
