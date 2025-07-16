@@ -54,22 +54,22 @@ def load_models_and_keys():
             temperature=0.1, 
             api_key=keys["GOOGLE_API_KEY"]
         ),
-        # FIX 1: Explicitly set the task parameter to avoid default text-generation
+        # FIX 1: Use HuggingFaceEndpoint with explicit task parameter
         "sentiment_analyzer": HuggingFaceEndpoint(
             repo_id=CONFIG["sentiment_model_repo_id"],
-            task="text-classification",  # Explicitly set this
-            huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"]
+            task="text-classification",
+            huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"],
+            model_kwargs={"task": "text-classification"}  # Extra emphasis on task type
         )
     }
     return keys, models
 
-# -------- PROMPTS (With formatting fix) --------
+# -------- PROMPTS --------
 fact_extraction_prompt = ChatPromptTemplate.from_messages([
     ("system", "You are a data extraction engine. From the provided news article text, extract the following information. Do not interpret, analyze, or add any information not present in the text. Your output must be a JSON object with the keys 'key_figures', 'core_event', and 'outlook'. If a key is not mentioned in the text, its value should be 'Not mentioned'."),
     ("human", "Article Text:\n```{article_text}```")
 ])
 
-# FIX 3: Properly escape the JSON schema curly braces in the prompt
 aggregate_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
@@ -100,7 +100,7 @@ aggregate_prompt = ChatPromptTemplate.from_messages([
     )
 ])
 
-# -------- HELPER FUNCTIONS (With bug fixes) --------
+# -------- HELPER FUNCTIONS --------
 def fetch_news(ticker, start_date, end_date, search_tool):
     try:
         query = f"stock market news for {ticker} between {start_date:%Y-%m-%d} and {end_date:%Y-%m-%d}"
@@ -135,53 +135,84 @@ def extract_key_facts(articles, fact_extraction_chain):
         return articles
 
 def score_sentiment(articles, sentiment_analyzer):
+    """FIX 2: Alternative sentiment scoring using direct HuggingFace API call"""
     if not articles: 
         return [], {}
+    
     try:
-        texts_to_score = [
-            (art.get("content") or art.get("title", ""))[:512]  # Truncate to avoid token limits
-            for art in articles
-        ]
+        import requests
         
-        # Process each text individually to handle API responses better
+        # Get HuggingFace API token from environment
+        hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+        if not hf_token:
+            st.error("HuggingFace API token not found")
+            return articles, {}
+        
+        # Direct API call to HuggingFace
+        API_URL = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
+        headers = {"Authorization": f"Bearer {hf_token}"}
+        
         scores = []
-        for i, text in enumerate(texts_to_score):
+        for i, article in enumerate(articles):
             try:
-                result = sentiment_analyzer.invoke(text)
-                # Handle different response formats
-                if isinstance(result, list):
-                    pmap = {d["label"].lower(): d["score"] for d in result}
-                elif isinstance(result, dict):
-                    pmap = {result["label"].lower(): result["score"]}
-                else:
-                    # Fallback for unexpected format
-                    pmap = {"positive": 0.0, "negative": 0.0, "neutral": 1.0}
+                text = (article.get("content") or article.get("title", ""))[:512]
                 
-                score = round(pmap.get("positive", 0) - pmap.get("negative", 0), 3)
-                articles[i]["sentiment_score"] = score
-                scores.append(score)
+                # Make API request
+                response = requests.post(API_URL, headers=headers, json={"inputs": text})
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    
+                    # Handle different response formats
+                    if isinstance(result, list) and len(result) > 0:
+                        predictions = result[0] if isinstance(result[0], list) else result
+                        
+                        # Convert to probability map
+                        pmap = {}
+                        for pred in predictions:
+                            label = pred["label"].lower()
+                            score = pred["score"]
+                            pmap[label] = score
+                        
+                        # Calculate sentiment score: positive - negative
+                        sentiment_score = pmap.get("positive", 0) - pmap.get("negative", 0)
+                        
+                        articles[i]["sentiment_score"] = round(sentiment_score, 3)
+                        scores.append(sentiment_score)
+                    else:
+                        st.warning(f"Unexpected response format for article {i}")
+                        articles[i]["sentiment_score"] = 0.0
+                        scores.append(0.0)
+                else:
+                    st.warning(f"API error for article {i}: {response.status_code}")
+                    articles[i]["sentiment_score"] = 0.0
+                    scores.append(0.0)
+                    
             except Exception as e:
                 st.warning(f"Error scoring sentiment for article {i}: {e}")
                 articles[i]["sentiment_score"] = 0.0
                 scores.append(0.0)
         
+        # Calculate sentiment statistics
         if scores:
-            sdf = pd.DataFrame(scores, columns=["score"])
             sentiment_analysis = {
-                "average_score": float(sdf["score"].mean()),
-                "std_dev_sentiment": float(sdf["score"].std()) if len(scores) > 1 else 0.0,
+                "average_score": float(np.mean(scores)),
+                "std_dev_sentiment": float(np.std(scores)) if len(scores) > 1 else 0.0,
                 "num_articles": len(scores),
-                "num_positive": int(sdf[sdf["score"] > 0.1].count().iloc[0]),
-                "num_negative": int(sdf[sdf["score"] < -0.1].count().iloc[0]),
-                "num_neutral": int(sdf[(sdf["score"] >= -0.1) & (sdf["score"] <= 0.1)].count().iloc[0])
+                "num_positive": sum(1 for s in scores if s > 0.1),
+                "num_negative": sum(1 for s in scores if s < -0.1),
+                "num_neutral": sum(1 for s in scores if -0.1 <= s <= 0.1)
             }
             return articles, sentiment_analysis
+        
         return articles, {}
+        
     except Exception as e:
-        st.error(f"Error scoring sentiment: {e}")
+        st.error(f"Error in sentiment scoring: {e}")
         return articles, {}
 
 def fetch_and_analyse_finance(ticker, start_date, end_date):
+    """FIX 3: Fixed pandas Series boolean operations"""
     try:
         end_date_adj = end_date + dt.timedelta(days=1)
         df = yf.download(ticker, start=start_date, end=end_date_adj, progress=False, ignore_tz=True)
@@ -189,21 +220,26 @@ def fetch_and_analyse_finance(ticker, start_date, end_date):
         if df.empty or len(df) < 2: 
             raise ValueError("Not enough historical data found.")
         
+        # Calculate period return
         n_day_return = (df['Close'].iloc[-1] / df['Close'].iloc[0]) - 1
-        daily_returns = df['Close'].pct_change().dropna()  # Remove NaN values
         
-        # FIX 2: Properly handle pandas Series boolean operations
+        # Calculate daily returns and handle NaN values
+        daily_returns = df['Close'].pct_change().dropna()
+        
+        # FIX: Properly handle pandas Series for largest move calculation
         if len(daily_returns) > 0:
             largest_move = daily_returns.abs().max()
-            largest_move_pct = float(round(largest_move * 100, 2)) if not pd.isna(largest_move) else 0.0
+            largest_move_pct = float(largest_move * 100) if not pd.isna(largest_move) else 0.0
         else:
             largest_move_pct = 0.0
         
         finance_analysis = {
             "period_return_pct": float(round(n_day_return * 100, 2)),
-            "largest_daily_move_pct": largest_move_pct
+            "largest_daily_move_pct": round(largest_move_pct, 2)
         }
+        
         return df, finance_analysis
+        
     except Exception as e:
         st.error(f"Error analyzing finance for {ticker}: {e}")
         return pd.DataFrame(), {}
