@@ -18,7 +18,7 @@ from langchain_huggingface import HuggingFaceEndpoint
 from langchain_community.utilities.google_serper import GoogleSerperAPIWrapper
 
 # ==============================================================================
-# 1. CORE PIPELINE LOGIC (Linear, Uncontaminated, and Robust)
+# 1. CORE PIPELINE LOGIC
 # ==============================================================================
 
 # --------  CONFIG  --------
@@ -47,25 +47,36 @@ def load_models_and_keys():
 # -------- STATE & PROMPTS --------
 class PipelineState(Dict):
     ticker: str; start_date: dt.date; end_date: dt.date; news_raw: List[Dict] = []; key_facts: List[Dict] = []; finance_analysis: Dict = {}; sentiment_scored: List[Dict] = []; sentiment_analysis: Dict = {}; report: Dict = {}; error: str = None
-
 fact_extraction_prompt = ChatPromptTemplate.from_messages([("system", "You are a data extraction engine. From the provided news article text, extract the following information. Do not interpret, analyze, or add any information not present in the text. Your output must be a JSON object with the keys 'key_figures', 'core_event', and 'outlook'. If a key is not mentioned in the text, its value should be 'Not mentioned'."),("human", "Article Text:\n```{article_text}```")])
 aggregate_prompt = ChatPromptTemplate.from_messages([("system", "You are a quantitative investment strategist. Your task is to synthesize three independent streams of pre-computed data: quantitative sentiment, extracted factual catalysts, and market price action. Your goal is to identify **divergence** or **convergence** between the news narrative and the stock's performance.\n\n**Analytical Framework:**\n1.  **Review Sentiment Profile:** Is the statistical sentiment profile Positive, Negative, or Contentious (high standard deviation)?\n2.  **Review Factual Catalysts:** Do the extracted key facts represent clear positive or negative events?\n3.  **Review Price Action:** Did the stock significantly outperform, underperform, or track the market?\n4.  **Formulate Thesis:** Synthesize the three data streams. Is there a clear DIVERGENCE? (e.g., 'Despite a negative sentiment profile and no clear positive catalysts, the stock remained resilient, suggesting the market has already priced in known risks.') Or is there a CONVERGENCE? (e.g., 'Strong positive sentiment, driven by the new product launch, is confirmed by the stock's significant outperformance.')\n\n**Output Schema (Strict JSON):**\n```json\n{\n  \"ticker\": \"<The stock ticker>\",\n  \"investment_thesis\": \"<Your concise thesis based on the divergence/convergence analysis>\",\n  \"final_score\": <Integer from 1 to 10>,\n  \"score_justification\": \"<1-sentence justification for your score, citing the thesis.>\"\n}\n```"),("human","Input Data for Ticker: {ticker}\n\n**Quantitative Sentiment Profile:**\n```{sent_analysis}```\n\n**Extracted Factual Catalysts:**\n```{key_facts}```\n\n**Quantitative Price Action:**\n```{fin_analysis}```")])
 
-# -------- NODE HELPERS --------
+# -------- NODE HELPERS (With Defensive Fix) --------
 def fetch_news(state: PipelineState) -> PipelineState:
     try:
         t = state["ticker"]; serper = GoogleSerperAPIWrapper(type_="news")
         query = f"\"{t}\" stock news after:{state['start_date']:%Y-%m-%d} before:{state['end_date']:%Y-%m-%d}"
         result = serper.run(query)
+
+        # --- FIX: Defensively check for an empty response from the API ---
+        if not result or not result.strip():
+            state["news_raw"] = [] # Gracefully handle no results
+            return state
+
         state["news_raw"] = json.loads(result).get("news", [])[:CONFIG["max_articles_per_ticker"]]
-    except Exception as e: state["error"] = f"News fetching failed: {e}"
+
+    except json.JSONDecodeError:
+        # Handle cases where the API returns a non-JSON string
+        state["error"] = f"News fetching failed: Serper returned an invalid (non-JSON) response."
+        state["news_raw"] = []
+    except Exception as e:
+        state["error"] = f"News fetching failed: {e}"
+        state["news_raw"] = []
     return state
 
 def extract_key_facts(state: PipelineState, fact_extraction_chain) -> PipelineState:
     if state.get("error") or not state.get("news_raw"): return state
     try:
-        articles = state["news_raw"]
-        batch_inputs = [{"article_text": (art.get("snippet") or art.get("title", ""))} for art in articles]
+        articles = state["news_raw"]; batch_inputs = [{"article_text": (art.get("snippet") or art.get("title", ""))} for art in articles]
         if not batch_inputs: return state
         batch_results = fact_extraction_chain.batch(batch_inputs, {"max_concurrency": 5})
         for i, article in enumerate(articles):
@@ -77,8 +88,7 @@ def extract_key_facts(state: PipelineState, fact_extraction_chain) -> PipelineSt
 def score_sentiment(state: PipelineState, sentiment_analyzer) -> PipelineState:
     if state.get("error") or not state.get("news_raw"): return state
     try:
-        articles = state["news_raw"]
-        texts_to_score = [(art.get("snippet") or art.get("title", "")) for art in articles]
+        articles = state["news_raw"]; texts_to_score = [(art.get("snippet") or art.get("title", "")) for art in articles]
         if not texts_to_score: return state
         api_results = sentiment_analyzer.batch(texts_to_score)
         scores = []
@@ -130,7 +140,6 @@ def run_pipeline_for_one_ticker(_models, _ticker, _start_date, _end_date):
     fact_extraction_chain = fact_extraction_prompt | _models['fact_extractor_llm'] | JsonOutputParser()
     aggregate_chain = aggregate_prompt | _models['analyst_llm'] | JsonOutputParser()
     
-    # --- FIX: A simple, robust, LINEAR graph. No parallelism. ---
     g = StateGraph(PipelineState)
     g.add_node("fetch_news", fetch_news)
     g.add_node("extract_key_facts", lambda state: extract_key_facts(state, fact_extraction_chain))
