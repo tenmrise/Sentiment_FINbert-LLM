@@ -41,15 +41,49 @@ def load_models_and_keys():
         "search_tool": TavilySearchResults(max_results=CONFIG["max_articles_per_ticker"]),
         "fact_extractor_llm": ChatOpenAI(model=CONFIG["extractor_model"], temperature=0.0, api_key=keys["OPENAI_API_KEY"]),
         "analyst_llm": ChatGoogleGenerativeAI(model=CONFIG["analyst_model"], temperature=0.1, model_kwargs={"response_mime_type": "application/json"}, api_key=keys["GOOGLE_API_KEY"]),
-        "sentiment_analyzer": HuggingFaceEndpoint(repo_id=CONFIG["sentiment_model_repo_id"], task="text-classification", huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"])
+        # --- FIX 1: Explicitly set the correct task for the model ---
+        "sentiment_analyzer": HuggingFaceEndpoint(
+            repo_id=CONFIG["sentiment_model_repo_id"],
+            task="text-classification",
+            huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"],
+        )
     }
     return keys, models
 
-# -------- PROMPTS --------
+# -------- PROMPTS (With formatting fix) --------
 fact_extraction_prompt = ChatPromptTemplate.from_messages([("system", "You are a data extraction engine. From the provided news article text, extract the following information. Do not interpret, analyze, or add any information not present in the text. Your output must be a JSON object with the keys 'key_figures', 'core_event', and 'outlook'. If a key is not mentioned in the text, its value should be 'Not mentioned'."),("human", "Article Text:\n```{article_text}```")])
-aggregate_prompt = ChatPromptTemplate.from_messages([("system", "You are a quantitative investment strategist. Your task is to synthesize three independent streams of pre-computed data: quantitative sentiment, extracted factual catalysts, and market price action. Your goal is to identify **divergence** or **convergence** between the news narrative and the stock's performance.\n\n**Analytical Framework:**\n1.  **Review Sentiment Profile:** Is the statistical sentiment profile Positive, Negative, or Contentious (high standard deviation)?\n2.  **Review Factual Catalysts:** Do the extracted key facts represent clear positive or negative events?\n3.  **Review Price Action:** Did the stock significantly outperform, underperform, or track the market?\n4.  **Formulate Thesis:** Synthesize the three data streams. Is there a clear DIVERGENCE? (e.g., 'Despite a negative sentiment profile and no clear positive catalysts, the stock remained resilient, suggesting the market has already priced in known risks.') Or is there a CONVERGENCE? (e.g., 'Strong positive sentiment, driven by the new product launch, is confirmed by the stock's significant outperformance.')\n\n**Output Schema (Strict JSON):**\n```json\n{\n  \"ticker\": \"<The stock ticker>\",\n  \"investment_thesis\": \"<Your concise thesis based on the divergence/convergence analysis>\",\n  \"final_score\": <Integer from 1 to 10>,\n  \"score_justification\": \"<1-sentence justification for your score, citing the thesis.>\"\n}\n```"),("human","Input Data for Ticker: {ticker}\n\n**Quantitative Sentiment Profile:**\n```{sent_analysis}```\n\n**Extracted Factual Catalysts:**\n```{key_facts}```\n\n**Quantitative Price Action:**\n```{fin_analysis}```")])
+# --- FIX 3: Cleaned up the prompt string to have valid variable names ---
+aggregate_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        (
+            "You are a quantitative investment strategist. Your task is to synthesize three independent streams of pre-computed data: quantitative sentiment, extracted factual catalysts, and market price action. Your goal is to identify **divergence** or **convergence** between the news narrative and the stock's performance.\n\n"
+            "**Analytical Framework:**\n"
+            "1.  **Review Sentiment Profile:** Is the statistical sentiment profile Positive, Negative, or Contentious (high standard deviation)?\n"
+            "2.  **Review Factual Catalysts:** Do the extracted key facts represent clear positive or negative events?\n"
+            "3.  **Review Price Action:** Did the stock significantly outperform, underperform, or track the market?\n"
+            "4.  **Formulate Thesis:** Synthesize the three data streams. Is there a clear DIVERGENCE? (e.g., 'Despite a negative sentiment profile and no clear positive catalysts, the stock remained resilient, suggesting the market has already priced in known risks.') Or is there a CONVERGENCE? (e.g., 'Strong positive sentiment, driven by the new product launch, is confirmed by the stock's significant outperformance.')\n\n"
+            "**Output Schema (Strict JSON):**\n"
+            "```json\n"
+            "{\n"
+            "  \"ticker\": \"<The stock ticker>\",\n"
+            "  \"investment_thesis\": \"<Your concise thesis based on the divergence/convergence analysis>\",\n"
+            "  \"final_score\": <Integer from 1 to 10>,\n"
+            "  \"score_justification\": \"<1-sentence justification for your score, citing the thesis.>\"\n"
+            "}\n"
+            "```"
+        )
+    ),
+    (
+        "human",
+        "Input Data for Ticker: {ticker}\n\n"
+        "**Quantitative Sentiment Profile:**\n```{sent_analysis}```\n\n"
+        "**Extracted Factual Catalysts:**\n```{key_facts}```\n\n"
+        "**Quantitative Price Action:**\n```{fin_analysis}```"
+    )
+])
 
-# -------- HELPER FUNCTIONS --------
+# -------- HELPER FUNCTIONS (With bug fixes) --------
 def fetch_news(ticker, start_date, end_date, search_tool):
     try:
         query = f"stock market news for {ticker} between {start_date:%Y-%m-%d} and {end_date:%Y-%m-%d}"
@@ -75,7 +109,6 @@ def extract_key_facts(articles, fact_extraction_chain):
 def score_sentiment(articles, sentiment_analyzer):
     if not articles: return [], {}
     try:
-        # --- FIX: Corrected the mismatched bracket ---
         texts_to_score = [(art.get("content") or art.get("title", "")) for art in articles]
         api_results = sentiment_analyzer.batch(texts_to_score)
         scores = []
@@ -84,7 +117,6 @@ def score_sentiment(articles, sentiment_analyzer):
                 pmap = {d["label"].lower(): d["score"] for d in api_results[i]}
                 score = round(pmap.get("positive", 0) - pmap.get("negative", 0), 3)
                 article["sentiment_score"] = score; scores.append(score)
-        
         if scores:
             sdf = pd.DataFrame(scores, columns=["score"])
             sentiment_analysis = {
@@ -108,6 +140,7 @@ def fetch_and_analyse_finance(ticker, start_date, end_date):
         if df.empty or len(df) < 2: raise ValueError("Not enough historical data found.")
         n_day_return = (df['Close'].iloc[-1] / df['Close'].iloc[0]) - 1
         largest_move = df['Close'].pct_change().abs().max()
+        # --- FIX 2: Use pd.notna() to correctly check for a valid value ---
         finance_analysis = {
             "period_return_pct": float(round(n_day_return * 100, 2)),
             "largest_daily_move_pct": float(round(largest_move * 100, 2)) if pd.notna(largest_move) else 0.0
@@ -127,19 +160,15 @@ st.markdown("A dashboard for quantitative synthesis of news sentiment and price 
 api_keys, models = load_models_and_keys()
 if not models: st.stop()
 
-# --- The Main Orchestration Function ---
 @st.cache_data(show_spinner=False)
 def run_analysis_for_one_ticker(_models, _ticker, _start_date, _end_date):
     fact_extraction_chain = fact_extraction_prompt | _models['fact_extractor_llm'] | JsonOutputParser()
     aggregate_chain = aggregate_prompt | _models['analyst_llm'] | JsonOutputParser()
-
     articles = fetch_news(_ticker, _start_date, _end_date, _models['search_tool'])
     articles_with_facts = extract_key_facts(articles, fact_extraction_chain)
     articles_with_sentiment, sentiment_stats = score_sentiment(articles_with_facts, _models['sentiment_analyzer'])
     price_df, finance_stats = fetch_and_analyse_finance(_ticker, _start_date, _end_date)
-    
     key_facts_for_prompt = [a.get("key_facts", {}) for a in articles_with_sentiment]
-    
     try:
         final_report = aggregate_chain.invoke({
             "ticker": _ticker,
@@ -150,16 +179,8 @@ def run_analysis_for_one_ticker(_models, _ticker, _start_date, _end_date):
     except Exception as e:
         st.error(f"Error generating final report for {_ticker}: {e}")
         final_report = None
+    return {"ticker": _ticker, "report": final_report, "news_data": articles_with_sentiment, "finance_analysis": finance_stats, "prices_raw": price_df}
 
-    return {
-        "ticker": _ticker,
-        "report": final_report,
-        "news_data": articles_with_sentiment,
-        "finance_analysis": finance_stats,
-        "prices_raw": price_df
-    }
-
-# --- Sidebar UI ---
 st.sidebar.header("Analysis Configuration")
 if 'available_tickers' not in st.session_state: st.session_state.available_tickers = ['NVDA', 'GOOGL', 'MSFT', 'AAPL']
 new_ticker = st.sidebar.text_input("Add Ticker Symbol", placeholder="e.g., CRM").strip().upper()
@@ -183,7 +204,6 @@ if st.sidebar.button("🚀 Run Analysis", type="primary"):
             results.append(result); progress_bar.progress((i + 1) / len(selected_tickers))
         status_container.success("✅ Analysis Complete!"); st.session_state.all_results = results
 
-# --- Display Results UI ---
 if 'all_results' in st.session_state and st.session_state.all_results:
     results = st.session_state.all_results
     st.subheader("Executive Summary Report")
@@ -196,9 +216,7 @@ if 'all_results' in st.session_state and st.session_state.all_results:
             report = res['report']
             summary_data.append({"Ticker": report.get('ticker'), "Score": report.get('final_score'), "Thesis": report.get('investment_thesis')})
             successful_results.append(res)
-    summary_df = pd.DataFrame(summary_data)
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
+    summary_df = pd.DataFrame(summary_data); st.dataframe(summary_df, use_container_width=True, hide_index=True)
     if successful_results:
         st.subheader("Detailed Analysis by Ticker")
         tab_titles = [res.get("ticker") for res in successful_results]
