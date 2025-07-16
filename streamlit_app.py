@@ -28,14 +28,12 @@ CONFIG = {
     "summarizer_model": "gpt-4o",
     "verifier_model": "gpt-4o",
     "analyst_model": "gemini-2.5-pro",
-    # --- Using a standard, reliable sentiment model that works with the free Inference API ---
     "sentiment_model_repo_id": "ProsusAI/finbert",
 }
 
-# --------  API KEYS & MODELS (with caching and deployment fix) --------
+# --------  API KEYS & MODELS  --------
 @st.cache_resource
 def load_models_and_keys():
-    """Load API keys from .env and initialize models once."""
     load_dotenv()
     keys = {
         "SERPER_API_KEY": os.getenv("SERPER_API_KEY"),
@@ -46,26 +44,22 @@ def load_models_and_keys():
     if not all(keys.values()):
         st.error("API Key Missing! Ensure SERPER, OPENAI, GOOGLE, and HUGGINGFACEHUB keys are in your secrets.")
         return None, None
-
     models = {
         "summarizer_llm": ChatOpenAI(model=CONFIG["summarizer_model"], temperature=0.2, api_key=keys["OPENAI_API_KEY"]),
         "verifier_llm": ChatOpenAI(model=CONFIG["verifier_model"], temperature=0.0, api_key=keys["OPENAI_API_KEY"]),
         "analyst_llm": ChatGoogleGenerativeAI(model=CONFIG["analyst_model"], temperature=0.0, model_kwargs={"response_mime_type": "application/json"}, api_key=keys["GOOGLE_API_KEY"]),
-        "sentiment_analyzer": HuggingFaceEndpoint(
-            repo_id=CONFIG["sentiment_model_repo_id"],
-            task="text-classification",
-            huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"],
-        )
+        "sentiment_analyzer": HuggingFaceEndpoint(repo_id=CONFIG["sentiment_model_repo_id"], task="text-classification", huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"])
     }
     return keys, models
 
-# -------- STATE, PROMPTS, etc. (No changes needed in the rest of the file) --------
+# -------- STATE, PROMPTS, etc. --------
 class PipelineState(Dict):
     tickers: List[str]; start: dt.date; end: dt.date; news_raw: Dict[str, List[Dict]]; news_summaries: Dict[str, List[Dict]]; sentiment_scored: Dict[str, List[Dict]]; prices_raw: pd.DataFrame; finance_analysis: Dict[str, Dict]; verification: str | Dict; report: str; errors: List[str]
-summary_prompt = ChatPromptTemplate.from_messages([("system", "You are FinancialNewsSummarizerGPT. Produce exactly 3 concise bullet points (max 60 tokens each) accurately preserving all numbers, dates, and financial terms."), ("human", "{article_text}")])
-verify_prompt = ChatPromptTemplate.from_messages([("system", "You are FactCheckGPT. Cross-reference the financial analysis with the news sentiment. If there are no major inconsistencies, output 'OK'. Otherwise, provide a brief JSON list of observations or corrections."), ("human", "Sentiment Analysis JSON:\n```{sent_json}```\n\nFinancial Data JSON:\n```{fin_json}```")])
-aggregate_prompt = ChatPromptTemplate.from_messages([("system", "You are ChiefInvestmentStrategistGPT. Combine news sentiment, financial data, and verification notes to create an investment score from 1 (strong sell) to 10 (strong buy) for each ticker. Explain your reasoning. Return a single JSON object where keys are the tickers."), ("human", "Sentiment Data:\n{sent}\n\nFinancial Data:\n{fin}\n\nVerification Notes:\n{corr}")])
+summary_prompt = ChatPromptTemplate.from_messages([("system", "You are FinancialNewsSummarizerGPT. Produce exactly 3 concise bullet points preserving numbers and dates."), ("human", "{article_text}")])
+verify_prompt = ChatPromptTemplate.from_messages([("system", "You are FactCheckGPT. Cross-reference financial analysis and news sentiment. If consistent, output 'OK'. Else, provide a brief JSON list of observations."), ("human", "Sentiment Analysis:\n```{sent_json}```\n\nFinancial Data:\n```{fin_json}```")])
+aggregate_prompt = ChatPromptTemplate.from_messages([("system", "You are ChiefInvestmentStrategistGPT. Combine sentiment and price data to score 1-10. Explain your reasoning. Return a single JSON object where keys are the tickers."), ("human", "Sentiment Data:\n{sent}\n\nFinancial Data:\n{fin}\n\nVerification Notes:\n{corr}")])
 
+# -------- NODE HELPERS --------
 def fetch_news(state: PipelineState) -> PipelineState:
     serper = GoogleSerperAPIWrapper(type_="news"); out = {}
     for t in state["tickers"]:
@@ -76,10 +70,10 @@ def fetch_news(state: PipelineState) -> PipelineState:
         except Exception as e: state["errors"].append(f"Failed to fetch news for {t}: {e}"); out[t] = []
     state["news_raw"] = out; return state
 def summarise_news(state: PipelineState, summary_chain) -> PipelineState:
-    summaries = {}
+    summaries = {}; max_articles = CONFIG["max_articles_per_ticker"]
     for t, articles in state["news_raw"].items():
         if not articles: summaries[t] = []; continue
-        batch_inputs = [{"article_text": (art.get("snippet") or art.get("title", ""))} for art in articles[:CONFIG["max_articles_per_ticker"]] if (art.get("snippet") or art.get("title"))]
+        batch_inputs = [{"article_text": (art.get("snippet") or art.get("title", ""))} for art in articles[:max_articles] if (art.get("snippet") or art.get("title"))]
         if not batch_inputs: continue
         try:
             batch_results = summary_chain.batch(batch_inputs, {"max_concurrency": 5})
@@ -89,22 +83,17 @@ def summarise_news(state: PipelineState, summary_chain) -> PipelineState:
 def score_sentiment(state: PipelineState, sentiment_analyzer) -> PipelineState:
     scored = {}
     for t, items in state["news_summaries"].items():
-        scored[t] = []
-        texts_to_score = [it["summary"] for it in items if it.get("summary")]
+        scored[t] = []; texts_to_score = [it["summary"] for it in items if it.get("summary")]
         if not texts_to_score: continue
         try:
             api_results = sentiment_analyzer.batch(texts_to_score)
             for i, item in enumerate(items):
                 if i < len(api_results):
-                    probs = api_results[i]
-                    pmap = {d["label"].lower(): d["score"] for d in probs}
+                    pmap = {d["label"].lower(): d["score"] for d in api_results[i]}
                     score = pmap.get("positive", 0) - pmap.get("negative", 0)
-                    scored_item = {**item, "sentiment_score": round(score, 3)}
-                    scored[t].append(scored_item)
-        except Exception as e:
-            state["errors"].append(f"Failed to score sentiment for {t} via API: {e}")
-    state["sentiment_scored"] = scored
-    return state
+                    scored[t].append({**item, "sentiment_score": round(score, 3)})
+        except Exception as e: state["errors"].append(f"Failed to score sentiment for {t} via API: {e}")
+    state["sentiment_scored"] = scored; return state
 def fetch_finance_data(state: PipelineState) -> PipelineState:
     try:
         end_date = state["end"] + dt.timedelta(days=1); df = yf.download(state["tickers"], start=state["start"], end=end_date, progress=False)
@@ -137,8 +126,15 @@ def aggregate(state: PipelineState, aggregate_chain) -> PipelineState:
     except Exception as e: state["errors"].append(f"Final aggregation step failed: {e}"); state["report"] = {"error": "Report generation failed."}
     return state
 
+# --- NEW: Gatekeeper function to manage parallel branches ---
+def should_crosscheck(state: PipelineState) -> str:
+    if "finance_analysis" in state and "sentiment_scored" in state:
+        return "crosscheck"
+    else:
+        return "wait"
+
 # ==============================================================================
-# 2. STREAMLIT DASHBOARD UI (No changes needed below this line)
+# 2. STREAMLIT DASHBOARD UI
 # ==============================================================================
 st.set_page_config(layout="wide", page_title="Financial Sentiment Dashboard")
 st.title("Financial News & Sentiment Analysis Dashboard")
@@ -161,16 +157,32 @@ def run_pipeline(tickers, start_date, end_date):
     g.add_node("analyse_finance", analyse_finance_data)
     g.add_node("crosscheck", lambda state: crosscheck(state, verify_chain))
     g.add_node("aggregate", lambda state: aggregate(state, aggregate_chain))
+    
     g.set_entry_point("fetch_news")
     g.add_edge("fetch_news", "summarise_news"); g.add_edge("summarise_news", "score_sentiment")
     g.add_edge("fetch_news", "fetch_finance"); g.add_edge("fetch_finance", "analyse_finance")
-    g.add_edge("score_sentiment", "crosscheck"); g.add_edge("analyse_finance", "crosscheck")
-    g.add_edge("crosscheck", "aggregate"); g.add_edge("aggregate", END)
+    
+    # --- FIX: Use conditional edges to wait for both branches to complete ---
+    g.add_conditional_edges(
+        "score_sentiment",
+        should_crosscheck,
+        {"crosscheck": "crosscheck", "wait": END}
+    )
+    g.add_conditional_edges(
+        "analyse_finance",
+        should_crosscheck,
+        {"crosscheck": "crosscheck", "wait": END}
+    )
+    
+    g.add_edge("crosscheck", "aggregate")
+    g.add_edge("aggregate", END)
+    
     pipeline = g.compile()
     initial_state = { "tickers": tickers, "start": start_date, "end": end_date, "errors": [] }
     return pipeline.invoke(initial_state)
 
 st.sidebar.header("Analysis Configuration")
+# ... (The rest of the UI code is unchanged and correct) ...
 if 'available_tickers' not in st.session_state: st.session_state.available_tickers = ['NVDA', 'GOOGL', 'MSFT', 'AAPL', 'TSLA', 'AMZN', 'META']
 new_ticker = st.sidebar.text_input("Add Ticker Symbol", placeholder="e.g., CRM").strip().upper()
 if st.sidebar.button("Add Ticker"):
@@ -181,11 +193,13 @@ selected_tickers = st.sidebar.multiselect("Select Stock Tickers for Analysis", o
 today = dt.date.today()
 start_date = st.sidebar.date_input("Start Date", value=today - dt.timedelta(days=7))
 end_date = st.sidebar.date_input("End Date", value=today)
+
 if st.sidebar.button("🚀 Run Analysis", type="primary"):
     if not selected_tickers: st.warning("Please select at least one ticker.")
     elif start_date >= end_date: st.warning("Start Date must be before End Date.")
     else:
         with st.spinner("Analyzing... This may take a few minutes..."): st.session_state.final_state = run_pipeline(selected_tickers, start_date, end_date)
+
 if 'final_state' in st.session_state:
     state = st.session_state.final_state
     if state.get("errors"):
@@ -219,4 +233,5 @@ if 'final_state' in st.session_state:
                 with st.expander(f"**{item.get('published', 'Date N/A')}** | Score: {item.get('sentiment_score', 0)}"):
                     st.markdown(item.get("summary", "No summary available."))
                     st.link_button("Go to Article", item.get("link", "#"))
-else: st.info("Configure your analysis in the sidebar and click 'Run Analysis' to begin.")
+else:
+    st.info("Configure your analysis in the sidebar and click 'Run Analysis' to begin.")
