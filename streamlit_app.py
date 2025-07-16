@@ -4,8 +4,6 @@ import json
 import datetime as dt
 from typing import Dict, List, Any
 import numpy as np
-
-from dotenv import load_dotenv
 import pandas as pd
 import yfinance as yf
 import plotly.express as px
