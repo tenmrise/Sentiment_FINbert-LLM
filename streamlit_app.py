@@ -45,24 +45,16 @@ def load_models_and_keys():
     }
     return keys, models
 
-# -------- PROMPTS (Unchanged) --------
+# -------- PROMPTS --------
 fact_extraction_prompt = ChatPromptTemplate.from_messages([("system", "You are a data extraction engine. From the provided news article text, extract the following information. Do not interpret, analyze, or add any information not present in the text. Your output must be a JSON object with the keys 'key_figures', 'core_event', and 'outlook'. If a key is not mentioned in the text, its value should be 'Not mentioned'."),("human", "Article Text:\n```{article_text}```")])
 aggregate_prompt = ChatPromptTemplate.from_messages([("system", "You are a quantitative investment strategist. Your task is to synthesize three independent streams of pre-computed data: quantitative sentiment, extracted factual catalysts, and market price action. Your goal is to identify **divergence** or **convergence** between the news narrative and the stock's performance.\n\n**Analytical Framework:**\n1.  **Review Sentiment Profile:** Is the statistical sentiment profile Positive, Negative, or Contentious (high standard deviation)?\n2.  **Review Factual Catalysts:** Do the extracted key facts represent clear positive or negative events?\n3.  **Review Price Action:** Did the stock significantly outperform, underperform, or track the market?\n4.  **Formulate Thesis:** Synthesize the three data streams. Is there a clear DIVERGENCE? (e.g., 'Despite a negative sentiment profile and no clear positive catalysts, the stock remained resilient, suggesting the market has already priced in known risks.') Or is there a CONVERGENCE? (e.g., 'Strong positive sentiment, driven by the new product launch, is confirmed by the stock's significant outperformance.')\n\n**Output Schema (Strict JSON):**\n```json\n{\n  \"ticker\": \"<The stock ticker>\",\n  \"investment_thesis\": \"<Your concise thesis based on the divergence/convergence analysis>\",\n  \"final_score\": <Integer from 1 to 10>,\n  \"score_justification\": \"<1-sentence justification for your score, citing the thesis.>\"\n}\n```"),("human","Input Data for Ticker: {ticker}\n\n**Quantitative Sentiment Profile:**\n```{sent_analysis}```\n\n**Extracted Factual Catalysts:**\n```{key_facts}```\n\n**Quantitative Price Action:**\n```{fin_analysis}```")])
 
-# -------- HELPER FUNCTIONS (With Tavily Schema Fix) --------
+# -------- HELPER FUNCTIONS --------
 def fetch_news(ticker, start_date, end_date, search_tool):
     try:
         query = f"stock market news for {ticker} between {start_date:%Y-%m-%d} and {end_date:%Y-%m-%d}"
         articles = search_tool.invoke(query)
-        # --- FIX: Adapt Tavily's output schema to our internal app schema ---
-        renamed_articles = [
-            {
-                "title": art.get("title"),
-                "content": art.get("content"), # Use 'content' as the main text
-                "link": art.get("url")
-            }
-            for art in articles
-        ]
+        renamed_articles = [{"title": art.get("title"), "content": art.get("content"), "link": art.get("url")} for art in articles]
         return renamed_articles
     except Exception as e:
         st.error(f"Error fetching news for {ticker}: {e}")
@@ -71,7 +63,6 @@ def fetch_news(ticker, start_date, end_date, search_tool):
 def extract_key_facts(articles, fact_extraction_chain):
     if not articles: return []
     try:
-        # --- FIX: Use the 'content' key for analysis ---
         batch_inputs = [{"article_text": (art.get("content") or art.get("title", ""))} for art in articles]
         batch_results = fact_extraction_chain.batch(batch_inputs, {"max_concurrency": 5})
         for i, article in enumerate(articles):
@@ -84,8 +75,8 @@ def extract_key_facts(articles, fact_extraction_chain):
 def score_sentiment(articles, sentiment_analyzer):
     if not articles: return [], {}
     try:
-        # --- FIX: Use the 'content' key for analysis ---
-        texts_to_score = [(art.get("content") or art.get("title", ""))} for art in articles]
+        # --- FIX: Corrected the mismatched bracket ---
+        texts_to_score = [(art.get("content") or art.get("title", "")) for art in articles]
         api_results = sentiment_analyzer.batch(texts_to_score)
         scores = []
         for i, article in enumerate(articles):
@@ -230,10 +221,8 @@ if 'all_results' in st.session_state and st.session_state.all_results:
                 if not news_data: st.info(f"No news articles found.")
                 for item in news_data:
                     score = item.get('sentiment_score', 0); color = "green" if score > 0 else "red" if score < 0 else "blue"
-                    # --- FIX: Use the 'title' key for the expander label ---
                     with st.expander(f"**{item.get('title', 'Article')}** | Score: :{color}[{score:.3f}]"):
                         st.write("**Key Facts Extracted by LLM:**"); st.json(item.get('key_facts', 'No facts extracted.'))
-                        # --- FIX: Use the 'content' key for the original text ---
                         st.write("**Original Content:**"); st.write(item.get('content'))
                         st.link_button("Go to Article", item.get("link", "#"))
 else:
