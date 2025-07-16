@@ -76,9 +76,12 @@ aggregate_prompt = ChatPromptTemplate.from_messages([
 
 
 # -------- HELPER FUNCTIONS --------
+# --- IMPROVED VERSION ---
 def fetch_news(ticker, start_date, end_date, search_tool):
     try:
-        query = f"stock market news for {ticker} between {start_date:%Y-%m-%d} and {end_date:%Y-%m-%d}"
+        # Refined query to guide the search engine toward more recent, relevant news.
+        query = f"top recent financial news and analysis for {ticker} stock between {start_date:%Y-%m-%d} and {end_date:%Y-%m-%d}"
+        st.info(f"Searching for news with query: '{query}'")
         articles = search_tool.invoke(query)
         renamed_articles = [{"title": art.get("title"), "content": art.get("content"), "link": art.get("url")} for art in articles]
         return renamed_articles
@@ -98,7 +101,6 @@ def extract_key_facts(articles, fact_extraction_chain):
         st.error(f"Error extracting facts: {e}")
         return articles
 
-# --- FINAL VERSION: Reads full article using chunking to avoid errors ---
 def score_sentiment(articles, hf_api_key):
     if not articles: return [], {}
     if not hf_api_key:
@@ -110,15 +112,14 @@ def score_sentiment(articles, hf_api_key):
         all_article_scores = []
 
         for i, article in enumerate(articles):
-            text = (article.get("content") or article.get("title", ""))
+            text = (article.get("content") or art.get("title", ""))
             if not text:
                 article["sentiment_score"] = 0
                 all_article_scores.append(0)
                 continue
 
-            # Split the text by words and create chunks of a safe size
             words = text.split()
-            chunk_size = 200 # Approx. 1200 characters, very safe for 512 token limit
+            chunk_size = 300
             chunks = [" ".join(words[j:j + chunk_size]) for j in range(0, len(words), chunk_size)]
             
             chunk_scores = []
@@ -131,10 +132,8 @@ def score_sentiment(articles, hf_api_key):
                     score = round(pmap.get("positive", 0) - pmap.get("negative", 0), 3)
                     chunk_scores.append(score)
                     
-                    # Add delay to avoid rate-limiting
                     time.sleep(1) 
                 
-                # The final score for the article is the average of its chunk scores
                 if chunk_scores:
                     final_score = np.mean(chunk_scores)
                 else:
@@ -178,7 +177,6 @@ def fetch_and_analyse_finance(ticker, start_date, end_date):
 
         finance_analysis = {
             "period_return_pct": float(round(n_day_return * 100, 2)),
-            # This robust check prevents the ambiguity error
             "largest_daily_move_pct": float(round(largest_move * 100, 2)) if pd.notna(largest_move) else 0.0
         }
         return df, finance_analysis
