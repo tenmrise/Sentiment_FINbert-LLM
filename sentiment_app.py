@@ -118,7 +118,7 @@ def score_sentiment(articles, hf_api_key):
 
             # Split the text by words and create chunks of a safe size
             words = text.split()
-            chunk_size = 300 # Approx. 1200 characters, very safe for 512 token limit
+            chunk_size = 200 # Approx. 1200 characters, very safe for 512 token limit
             chunks = [" ".join(words[j:j + chunk_size]) for j in range(0, len(words), chunk_size)]
             
             chunk_scores = []
