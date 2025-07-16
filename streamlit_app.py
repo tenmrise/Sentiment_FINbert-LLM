@@ -4,10 +4,11 @@ import json
 import datetime as dt
 from typing import Dict, List, Any
 import numpy as np
+
+from dotenv import load_dotenv
 import pandas as pd
 import yfinance as yf
 import plotly.express as px
-from dotenv import load_dotenv
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
@@ -24,7 +25,7 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 CONFIG = {
     "max_articles_per_ticker": 5,
     "extractor_model": "gpt-4o",
-    "analyst_model": "gemini-2.5-pro",
+    "analyst_model": "gemini-1.5-pro",
     "sentiment_model_repo_id": "ProsusAI/finbert",
 }
 
