@@ -18,13 +18,13 @@ from langchain_huggingface import HuggingFaceEndpoint
 from langchain_community.utilities.google_serper import GoogleSerperAPIWrapper
 
 # ==============================================================================
-# 1. CORE PIPELINE LOGIC (Uncontaminated Architecture)
+# 1. CORE PIPELINE LOGIC (Linear, Uncontaminated, and Robust)
 # ==============================================================================
 
 # --------  CONFIG  --------
 CONFIG = {
     "max_articles_per_ticker": 5,
-    "extractor_model": "gpt-4o", # Renamed for clarity
+    "extractor_model": "gpt-4o",
     "analyst_model": "gemini-2.5-pro",
     "sentiment_model_repo_id": "ProsusAI/finbert",
 }
@@ -35,7 +35,7 @@ def load_models_and_keys():
     load_dotenv()
     keys = {"SERPER_API_KEY": os.getenv("SERPER_API_KEY"),"OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),"GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY"),"HUGGINGFACEHUB_API_TOKEN": os.getenv("HUGGINGFACEHUB_API_TOKEN")}
     if not all(keys.values()):
-        st.error("API Key Missing! Ensure SERPER, OPENAI, GOOGLE, and HUGGINGFACEHUB keys are in secrets.")
+        st.error("API Key Missing! Ensure SERPER, OPENAI, GOOGLE, and HUGGINGFACEHUB keys are in your secrets.")
         return None, None
     models = {
         "fact_extractor_llm": ChatOpenAI(model=CONFIG["extractor_model"], temperature=0.0, api_key=keys["OPENAI_API_KEY"]),
@@ -48,7 +48,7 @@ def load_models_and_keys():
 class PipelineState(Dict):
     ticker: str; start_date: dt.date; end_date: dt.date; news_raw: List[Dict] = []; key_facts: List[Dict] = []; finance_analysis: Dict = {}; sentiment_scored: List[Dict] = []; sentiment_analysis: Dict = {}; report: Dict = {}; error: str = None
 
-fact_extraction_prompt = ChatPromptTemplate.from_messages([("system", "You are a data extraction engine. From the provided news article text, extract the following information. Do not interpret, analyze, or add any information not present in the text. Your output must be a JSON object with the keys 'key_figures', 'core_event', and 'outlook'. If a key is not mentioned in the text, its value should be 'Not mentioned'.\n\n- 'key_figures': Report any specific numbers, percentages, financial results, or concrete dates.\n- 'core_event': State the primary event discussed (e.g., 'product launch', 'earnings report', 'executive departure').\n- 'outlook': Quote any forward-looking statement or guidance about future performance."),("human", "Article Text:\n```{article_text}```")])
+fact_extraction_prompt = ChatPromptTemplate.from_messages([("system", "You are a data extraction engine. From the provided news article text, extract the following information. Do not interpret, analyze, or add any information not present in the text. Your output must be a JSON object with the keys 'key_figures', 'core_event', and 'outlook'. If a key is not mentioned in the text, its value should be 'Not mentioned'."),("human", "Article Text:\n```{article_text}```")])
 aggregate_prompt = ChatPromptTemplate.from_messages([("system", "You are a quantitative investment strategist. Your task is to synthesize three independent streams of pre-computed data: quantitative sentiment, extracted factual catalysts, and market price action. Your goal is to identify **divergence** or **convergence** between the news narrative and the stock's performance.\n\n**Analytical Framework:**\n1.  **Review Sentiment Profile:** Is the statistical sentiment profile Positive, Negative, or Contentious (high standard deviation)?\n2.  **Review Factual Catalysts:** Do the extracted key facts represent clear positive or negative events?\n3.  **Review Price Action:** Did the stock significantly outperform, underperform, or track the market?\n4.  **Formulate Thesis:** Synthesize the three data streams. Is there a clear DIVERGENCE? (e.g., 'Despite a negative sentiment profile and no clear positive catalysts, the stock remained resilient, suggesting the market has already priced in known risks.') Or is there a CONVERGENCE? (e.g., 'Strong positive sentiment, driven by the new product launch, is confirmed by the stock's significant outperformance.')\n\n**Output Schema (Strict JSON):**\n```json\n{\n  \"ticker\": \"<The stock ticker>\",\n  \"investment_thesis\": \"<Your concise thesis based on the divergence/convergence analysis>\",\n  \"final_score\": <Integer from 1 to 10>,\n  \"score_justification\": \"<1-sentence justification for your score, citing the thesis.>\"\n}\n```"),("human","Input Data for Ticker: {ticker}\n\n**Quantitative Sentiment Profile:**\n```{sent_analysis}```\n\n**Extracted Factual Catalysts:**\n```{key_facts}```\n\n**Quantitative Price Action:**\n```{fin_analysis}```")])
 
 # -------- NODE HELPERS --------
@@ -59,28 +59,6 @@ def fetch_news(state: PipelineState) -> PipelineState:
         result = serper.run(query)
         state["news_raw"] = json.loads(result).get("news", [])[:CONFIG["max_articles_per_ticker"]]
     except Exception as e: state["error"] = f"News fetching failed: {e}"
-    return state
-
-def score_sentiment(state: PipelineState, sentiment_analyzer) -> PipelineState:
-    if state.get("error") or not state.get("news_raw"): return state
-    try:
-        articles = state["news_raw"]
-        texts_to_score = [art.get("snippet") or art.get("title", "") for art in articles]
-        if not texts_to_score: return state
-        
-        api_results = sentiment_analyzer.batch(texts_to_score)
-        scores = []
-        for i, article in enumerate(articles):
-            if i < len(api_results):
-                pmap = {d["label"].lower(): d["score"] for d in api_results[i]}
-                score = round(pmap.get("positive", 0) - pmap.get("negative", 0), 3)
-                article["sentiment_score"] = score; scores.append(score)
-        state["sentiment_scored"] = articles
-
-        if scores:
-            sdf = pd.DataFrame(scores, columns=["score"])
-            state["sentiment_analysis"] = {"average_score": round(sdf["score"].mean(), 3), "std_dev_sentiment": round(sdf["score"].std(), 3) if len(scores) > 1 else 0, "num_articles": len(scores), "num_positive": int(sdf[sdf["score"] > 0.1].count().iloc[0]), "num_negative": int(sdf[sdf["score"] < -0.1].count().iloc[0]), "num_neutral": int(sdf[(sdf["score"] >= -0.1) & (sdf["score"] <= 0.1)].count().iloc[0])}
-    except Exception as e: state["error"] = f"Sentiment analysis failed: {e}"
     return state
 
 def extract_key_facts(state: PipelineState, fact_extraction_chain) -> PipelineState:
@@ -94,6 +72,26 @@ def extract_key_facts(state: PipelineState, fact_extraction_chain) -> PipelineSt
             if i < len(batch_results): article["key_facts"] = batch_results[i]
         state["key_facts"] = articles
     except Exception as e: state["error"] = f"Fact extraction failed: {e}"
+    return state
+
+def score_sentiment(state: PipelineState, sentiment_analyzer) -> PipelineState:
+    if state.get("error") or not state.get("news_raw"): return state
+    try:
+        articles = state["news_raw"]
+        texts_to_score = [(art.get("snippet") or art.get("title", "")) for art in articles]
+        if not texts_to_score: return state
+        api_results = sentiment_analyzer.batch(texts_to_score)
+        scores = []
+        for i, article in enumerate(articles):
+            if i < len(api_results):
+                pmap = {d["label"].lower(): d["score"] for d in api_results[i]}
+                score = round(pmap.get("positive", 0) - pmap.get("negative", 0), 3)
+                article["sentiment_score"] = score; scores.append(score)
+        state["sentiment_scored"] = articles
+        if scores:
+            sdf = pd.DataFrame(scores, columns=["score"])
+            state["sentiment_analysis"] = {"average_score": round(sdf["score"].mean(), 3), "std_dev_sentiment": round(sdf["score"].std(), 3) if len(scores) > 1 else 0, "num_articles": len(scores), "num_positive": int(sdf[sdf["score"] > 0.1].count().iloc[0]), "num_negative": int(sdf[sdf["score"] < -0.1].count().iloc[0]), "num_neutral": int(sdf[(sdf["score"] >= -0.1) & (sdf["score"] <= 0.1)].count().iloc[0])}
+    except Exception as e: state["error"] = f"Sentiment analysis failed: {e}"
     return state
 
 def fetch_and_analyse_finance(state: PipelineState) -> PipelineState:
@@ -111,7 +109,6 @@ def fetch_and_analyse_finance(state: PipelineState) -> PipelineState:
 def aggregate(state: PipelineState, aggregate_chain) -> PipelineState:
     if state.get("error"): return state
     try:
-        # Extract just the key_facts dictionaries for the final prompt
         key_facts_for_prompt = [a.get("key_facts", {}) for a in state.get("key_facts", [])]
         report = aggregate_chain.invoke({"ticker": state["ticker"], "sent_analysis": json.dumps(state.get("sentiment_analysis", {})), "key_facts": json.dumps(key_facts_for_prompt), "fin_analysis": json.dumps(state.get("finance_analysis", {}))})
         state["report"] = report
@@ -132,20 +129,20 @@ if not models: st.stop()
 def run_pipeline_for_one_ticker(_models, _ticker, _start_date, _end_date):
     fact_extraction_chain = fact_extraction_prompt | _models['fact_extractor_llm'] | JsonOutputParser()
     aggregate_chain = aggregate_prompt | _models['analyst_llm'] | JsonOutputParser()
+    
+    # --- FIX: A simple, robust, LINEAR graph. No parallelism. ---
     g = StateGraph(PipelineState)
     g.add_node("fetch_news", fetch_news)
-    g.add_node("score_sentiment", lambda state: score_sentiment(state, _models['sentiment_analyzer']))
     g.add_node("extract_key_facts", lambda state: extract_key_facts(state, fact_extraction_chain))
+    g.add_node("score_sentiment", lambda state: score_sentiment(state, _models['sentiment_analyzer']))
     g.add_node("fetch_and_analyse_finance", fetch_and_analyse_finance)
     g.add_node("aggregate", lambda state: aggregate(state, aggregate_chain))
 
     g.set_entry_point("fetch_news")
-    # Run sentiment, facts, and finance analysis in parallel from the same raw news
-    g.add_edge("fetch_news", "score_sentiment")
     g.add_edge("fetch_news", "extract_key_facts")
-    g.add_edge("fetch_news", "fetch_and_analyse_finance")
-    # Join the three parallel branches before the final aggregation step
-    g.add_edge(["score_sentiment", "extract_key_facts", "fetch_and_analyse_finance"], "aggregate")
+    g.add_edge("extract_key_facts", "score_sentiment")
+    g.add_edge("score_sentiment", "fetch_and_analyse_finance")
+    g.add_edge("fetch_and_analyse_finance", "aggregate")
     g.add_edge("aggregate", END)
 
     pipeline = g.compile()
@@ -193,13 +190,13 @@ if 'all_results' in st.session_state and st.session_state.all_results:
                 report = res['report']
                 st.info(f"**Investment Thesis:** {report.get('investment_thesis')}")
                 st.write(f"**Justification:** {report.get('score_justification')}")
+                
                 st.subheader("Raw Data & Extracted Facts")
                 col1, col2 = st.columns(2); col1.metric(label=f"Return ({start_date} to {end_date})", value=f"{res['finance_analysis'].get('period_return_pct', 0):.2f}%"); col2.metric(label="Largest Single-Day Move", value=f"{res['finance_analysis'].get('largest_daily_move_pct', 0):.2f}%")
                 
                 prices_df = res.get("prices_raw")
                 if prices_df is not None and not prices_df.empty: fig = px.line(prices_df, y="Close", title=f"{res['ticker']} Stock Price"); st.plotly_chart(fig, use_container_width=True)
                 
-                # Using key_facts which now also contains the sentiment score
                 news_data = res.get("key_facts", []) 
                 if not news_data: st.info(f"No news articles found.")
                 for item in news_data:
