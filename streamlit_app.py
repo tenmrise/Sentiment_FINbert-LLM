@@ -25,7 +25,7 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 CONFIG = {
     "max_articles_per_ticker": 5,
     "extractor_model": "gpt-4o",
-    "analyst_model": "gemini-2.5-pro",
+    "analyst_model": "gemini-1.5-pro", # Note: Using a powerful model for analysis
     "sentiment_model_repo_id": "ProsusAI/finbert",
 }
 
@@ -44,7 +44,7 @@ def load_models_and_keys():
         # --- FIX 1: Explicitly set the correct task for the model ---
         "sentiment_analyzer": HuggingFaceEndpoint(
             repo_id=CONFIG["sentiment_model_repo_id"],
-            task="text-classification",
+            task="text-classification",  # This was changed from 'text-generation'
             huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"],
         )
     }
@@ -52,7 +52,9 @@ def load_models_and_keys():
 
 # -------- PROMPTS (With formatting fix) --------
 fact_extraction_prompt = ChatPromptTemplate.from_messages([("system", "You are a data extraction engine. From the provided news article text, extract the following information. Do not interpret, analyze, or add any information not present in the text. Your output must be a JSON object with the keys 'key_figures', 'core_event', and 'outlook'. If a key is not mentioned in the text, its value should be 'Not mentioned'."),("human", "Article Text:\n```{article_text}```")])
+
 # --- FIX 3: Cleaned up the prompt string to have valid variable names ---
+# The human message template was corrected to ensure variable names are clean.
 aggregate_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
@@ -140,7 +142,9 @@ def fetch_and_analyse_finance(ticker, start_date, end_date):
         if df.empty or len(df) < 2: raise ValueError("Not enough historical data found.")
         n_day_return = (df['Close'].iloc[-1] / df['Close'].iloc[0]) - 1
         largest_move = df['Close'].pct_change().abs().max()
-        # --- FIX 2: Use pd.notna() to correctly check for a valid value ---
+        
+        # --- FIX 2: Use pd.notna() to correctly check for a valid NaN value ---
+        # The original code failed here when largest_move was NaN.
         finance_analysis = {
             "period_return_pct": float(round(n_day_return * 100, 2)),
             "largest_daily_move_pct": float(round(largest_move * 100, 2)) if pd.notna(largest_move) else 0.0
@@ -170,6 +174,7 @@ def run_analysis_for_one_ticker(_models, _ticker, _start_date, _end_date):
     price_df, finance_stats = fetch_and_analyse_finance(_ticker, _start_date, _end_date)
     key_facts_for_prompt = [a.get("key_facts", {}) for a in articles_with_sentiment]
     try:
+        # The dictionary keys here must exactly match the variables in the fixed aggregate_prompt
         final_report = aggregate_chain.invoke({
             "ticker": _ticker,
             "sent_analysis": json.dumps(sentiment_stats),
@@ -210,9 +215,9 @@ if 'all_results' in st.session_state and st.session_state.all_results:
     summary_data = []
     successful_results = []
     for res in results:
-        if not res or not res.get('report'): 
+        if not res or not res.get('report'):
             summary_data.append({"Ticker": res.get('ticker', 'N/A'), "Score": "N/A", "Thesis": "ERROR: Analysis failed to complete."})
-        else: 
+        else:
             report = res['report']
             summary_data.append({"Ticker": report.get('ticker'), "Score": report.get('final_score'), "Thesis": report.get('investment_thesis')})
             successful_results.append(res)
@@ -235,7 +240,7 @@ if 'all_results' in st.session_state and st.session_state.all_results:
                 if prices_df is not None and not prices_df.empty:
                     fig = px.line(prices_df, y="Close", title=f"{res['ticker']} Stock Price")
                     st.plotly_chart(fig, use_container_width=True)
-                news_data = res.get("news_data", []) 
+                news_data = res.get("news_data", [])
                 if not news_data: st.info(f"No news articles found.")
                 for item in news_data:
                     score = item.get('sentiment_score', 0); color = "green" if score > 0 else "red" if score < 0 else "blue"
