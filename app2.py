@@ -24,7 +24,7 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 CONFIG = {
     "max_articles_per_ticker": 5,
     "extractor_model": "gpt-4o",
-    "analyst_model": "gemini-2.5-pro",
+    "analyst_model": "gemini-2.0-flash-exp",
     "sentiment_model_repo_id": "ProsusAI/finbert",
 }
 
@@ -58,8 +58,7 @@ def load_models_and_keys():
         "sentiment_analyzer": HuggingFaceEndpoint(
             repo_id=CONFIG["sentiment_model_repo_id"],
             task="text-classification",  # Explicitly set this
-            huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"],
-            model_kwargs={"return_all_scores": True}  # Get all sentiment scores
+            huggingfacehub_api_token=keys["HUGGINGFACEHUB_API_TOKEN"]
         )
     }
     return keys, models
@@ -191,14 +190,18 @@ def fetch_and_analyse_finance(ticker, start_date, end_date):
             raise ValueError("Not enough historical data found.")
         
         n_day_return = (df['Close'].iloc[-1] / df['Close'].iloc[0]) - 1
-        daily_returns = df['Close'].pct_change()
+        daily_returns = df['Close'].pct_change().dropna()  # Remove NaN values
         
         # FIX 2: Properly handle pandas Series boolean operations
-        largest_move = daily_returns.abs().max()
+        if len(daily_returns) > 0:
+            largest_move = daily_returns.abs().max()
+            largest_move_pct = float(round(largest_move * 100, 2)) if not pd.isna(largest_move) else 0.0
+        else:
+            largest_move_pct = 0.0
         
         finance_analysis = {
             "period_return_pct": float(round(n_day_return * 100, 2)),
-            "largest_daily_move_pct": float(round(largest_move * 100, 2)) if not pd.isna(largest_move) else 0.0
+            "largest_daily_move_pct": largest_move_pct
         }
         return df, finance_analysis
     except Exception as e:
