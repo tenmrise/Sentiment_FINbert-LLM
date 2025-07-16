@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import plotly.express as px
+from dotenv import load_dotenv
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
