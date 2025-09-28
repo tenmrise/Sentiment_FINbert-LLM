@@ -4,7 +4,7 @@ langgraph>=0.0.60
 langchain-openai>=0.1.8
 langchain-google-genai>=1.0.3
 langchain-community
-langchain-huggingface  # <-- ADD THIS LINE
+langchain-huggingface  
 transformers>=4.41.0
 torch>=2.0.0
 accelerate
@@ -14,6 +14,6 @@ python-dotenv>=1.0.0
 google-search-results>=2.4.2
 streamlit>=1.35.0
 plotly>=5.0.0
-huggingface-hub      # <-- ADD THIS LINE
+huggingface-hub      
 requests
 numpy
